@@ -1,0 +1,7 @@
+actor       User       as A1
+boundary    connection  as B1
+entity      Entity      as E1
+A1 ->  B1 : GET KEY
+B1 -> E1 : GET KEY / HASH(KEY)
+E1 -> B1 : Result(KEY)
+B1 -> A1 : Response
