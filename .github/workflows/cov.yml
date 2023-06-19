@@ -1,0 +1,47 @@
+name: Daily Coverage Roman
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # The CMake configure and build commands are platform agnostic and should work equally
+    # well on Windows or Mac.  You can convert this to a matrix build if you need
+    # cross-platform coverage.
+    # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - container: "ubuntu-dev:20"
+            build-type: Debug
+            compiler: {cxx: g++, c: gcc}
+            cxx_flags: "-fprofile-arcs -ftest-coverage"
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/romange/${{ matrix.container }}
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+      - name: Build & Test
+        id: cov_gen
+        run: |
+          # TODO: run epoll as well.
+          mkdir coverage
+          echo line1  >> coverage/output.txt
+          echo line2  >> coverage/output.txt
+          echo line3  >> coverage/output.txt
+          ls coverage/
+          echo now current dir
+          ls -l ./
+      - name: Upload coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage/output.txt
+          if-no-files-found: error
