@@ -1,23 +1,21 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
 #pragma once
 
 #include "facade/op_status.h"
-#include "server/common.h"
-
+#include "server/table.h"
+#include "server/tx_base.h"
 
 typedef struct intset intset;
-typedef struct dict dict;
 
 namespace dfly {
 
 using facade::OpResult;
 
-class ConnectionContext;
 class CommandRegistry;
-class EngineShard;
+class StringSet;
 
 class SetFamily {
  public:
@@ -25,28 +23,16 @@ class SetFamily {
 
   static uint32_t MaxIntsetEntries();
 
-  static void ConvertTo(const intset* src, dict* dest);
+  // Returns nullptr on OOM.
+  static StringSet* ConvertToStrSet(const intset* is, size_t expected_len);
 
- private:
-  static void SAdd(CmdArgList args,  ConnectionContext* cntx);
-  static void SIsMember(CmdArgList args,  ConnectionContext* cntx);
-  static void SRem(CmdArgList args,  ConnectionContext* cntx);
-  static void SCard(CmdArgList args,  ConnectionContext* cntx);
-  static void SPop(CmdArgList args,  ConnectionContext* cntx);
-  static void SUnion(CmdArgList args,  ConnectionContext* cntx);
-  static void SUnionStore(CmdArgList args,  ConnectionContext* cntx);
-  static void SDiff(CmdArgList args,  ConnectionContext* cntx);
-  static void SDiffStore(CmdArgList args,  ConnectionContext* cntx);
-  static void SMembers(CmdArgList args,  ConnectionContext* cntx);
-  static void SMove(CmdArgList args,  ConnectionContext* cntx);
-  static void SInter(CmdArgList args,  ConnectionContext* cntx);
-  static void SInterStore(CmdArgList args,  ConnectionContext* cntx);
-  static void SScan(CmdArgList args,  ConnectionContext* cntx);
+  // returns expiry time in seconds since kMemberExpiryBase date.
+  // returns -3 if field was not found, -1 if no ttl is associated with the item.
+  static int32_t FieldExpireTime(const DbContext& db_context, const PrimeValue& pv,
+                                 std::string_view field);
 
-  // count - how many elements to pop.
-  static OpResult<StringVec> OpPop(const OpArgs& op_args, std::string_view key, unsigned count);
-  static OpResult<StringVec> OpScan(const OpArgs& op_args, std::string_view key, uint64_t* cursor);
-
+  static std::vector<long> SetFieldsExpireTime(const OpArgs& op_args, uint32_t ttl_sec,
+                                               CmdArgList values, PrimeValue* pv);
 };
 
 }  // namespace dfly

@@ -1,4 +1,4 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2024, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -12,17 +12,11 @@ extern "C" {
 #include <absl/container/flat_hash_map.h>
 #include <xxhash.h>
 
-#include "base/string_view_sso.h"
-#include "core/external_alloc.h"
 #include "core/mi_memory_resource.h"
-#include "core/tx_queue.h"
-#include "server/channel_slice.h"
 #include "server/db_slice.h"
-#include "util/fibers/fiberqueue_threadpool.h"
-#include "util/fibers/fibers_ext.h"
+#include "server/engine_shard.h"
 #include "util/proactor_pool.h"
 #include "util/sliding_counter.h"
-
 
 namespace dfly {
 
@@ -31,162 +25,9 @@ class Journal;
 }  // namespace journal
 
 class TieredStorage;
+class ShardDocIndices;
 class BlockingController;
-
-class EngineShard {
- public:
-  struct Stats {
-    uint64_t ooo_runs = 0;    // how many times transactions run as OOO.
-    uint64_t quick_runs = 0;  //  how many times single shard "RunQuickie" transaction run.
-
-    Stats& operator+=(const Stats&);
-  };
-
-  // EngineShard() is private down below.
-  ~EngineShard();
-
-  // Sets up a new EngineShard in the thread.
-  // If update_db_time is true, initializes periodic time update for its db_slice.
-  static void InitThreadLocal(util::ProactorBase* pb, bool update_db_time);
-
-  static void DestroyThreadLocal();
-
-  static EngineShard* tlocal() {
-    return shard_;
-  }
-
-  ShardId shard_id() const {
-    return db_slice_.shard_id();
-  }
-
-  DbSlice& db_slice() {
-    return db_slice_;
-  }
-
-  const DbSlice& db_slice() const {
-    return db_slice_;
-  }
-
-  ChannelSlice& channel_slice() {
-    return channel_slice_;
-  }
-
-  std::pmr::memory_resource* memory_resource() {
-    return &mi_resource_;
-  }
-
-  ::util::fibers_ext::FiberQueue* GetFiberQueue() {
-    return &queue_;
-  }
-
-  // Processes TxQueue, blocked transactions or any other execution state related to that
-  // shard. Tries executing the passed transaction if possible (does not guarantee though).
-  void PollExecution(const char* context, Transaction* trans);
-
-  // Returns transaction queue.
-  TxQueue* txq() {
-    return &txq_;
-  }
-
-  TxId committed_txid() const {
-    return committed_txid_;
-  }
-
-  // Signals whether shard-wide lock is active.
-  // Transactions that conflict with shard locks must subscribe into pending queue.
-  IntentLock* shard_lock() {
-    return &shard_lock_;
-  }
-
-
-  // TODO: Awkward interface. I should solve it somehow.
-  void ShutdownMulti(Transaction* multi);
-
-  void IncQuickRun() {
-    stats_.quick_runs++;
-  }
-
-  const Stats& stats() const {
-    return stats_;
-  }
-
-  // Returns used memory for this shard.
-  size_t UsedMemory() const;
-
-  TieredStorage* tiered_storage() { return tiered_storage_.get(); }
-
-  // Adds blocked transaction to the watch-list.
-  void AddBlocked(Transaction* trans);
-
-  BlockingController* blocking_controller() {
-    return blocking_controller_.get();
-  }
-
-  // for everyone to use for string transformations during atomic cpu sequences.
-  sds tmp_str1;
-
-
-  // Moving average counters.
-  enum MovingCnt {
-    TTL_TRAVERSE,
-    TTL_DELETE,
-    COUNTER_TOTAL
-  };
-
-  // Returns moving sum over the last 6 seconds.
-  uint32_t GetMovingSum6(MovingCnt type) const {
-    return counter_[unsigned(type)].SumTail();
-  }
-
-  journal::Journal* journal() {
-    return journal_;
-  }
-
-  void set_journal(journal::Journal* j) {
-    journal_ = j;
-  }
-
-  void TEST_EnableHeartbeat();
-
- private:
-  EngineShard(util::ProactorBase* pb, bool update_db_time, mi_heap_t* heap);
-
-  // blocks the calling fiber.
-  void Shutdown();  // called before destructing EngineShard.
-
-  void Heartbeat();
-
-  void CacheStats();
-
-
-  ::util::fibers_ext::FiberQueue queue_;
-  ::boost::fibers::fiber fiber_q_;
-
-  TxQueue txq_;
-  MiMemoryResource mi_resource_;
-  DbSlice db_slice_;
-  ChannelSlice channel_slice_;
-
-  Stats stats_;
-
-  // Logical ts used to order distributed transactions.
-  TxId committed_txid_ = 0;
-  Transaction* continuation_trans_ = nullptr;
-  journal::Journal* journal_ = nullptr;
-  IntentLock shard_lock_;
-
-  uint32_t periodic_task_ = 0;
-  uint64_t task_iters_ = 0;
-  std::unique_ptr<TieredStorage> tiered_storage_;
-  std::unique_ptr<BlockingController> blocking_controller_;
-
-  using Counter = util::SlidingCounter<7>;
-
-  Counter counter_[COUNTER_TOTAL];
-  std::vector<Counter> ttl_survivor_sum_;  // we need it per db.
-
-  static thread_local EngineShard* shard_;
-};
+class EngineShardSet;
 
 class EngineShardSet {
  public:
@@ -204,86 +45,131 @@ class EngineShardSet {
   }
 
   uint32_t size() const {
-    return uint32_t(shard_queue_.size());
+    return size_;
   }
 
   util::ProactorPool* pool() {
     return pp_;
   }
 
-  void Init(uint32_t size, bool update_db_time);
-  void Shutdown();
+  void Init(uint32_t size, std::function<void()> shard_handler);
 
-  static const std::vector<CachedStats>& GetCachedStats();
+  // Shutdown sequence:
+  // - EngineShardSet.PreShutDown()
+  // - Namespaces.Clear()
+  // - EngineShardSet.Shutdown()
+  void PreShutdown();
+  void Shutdown();
 
   // Uses a shard queue to dispatch. Callback runs in a dedicated fiber.
   template <typename F> auto Await(ShardId sid, F&& f) {
-    return shard_queue_[sid]->Await(std::forward<F>(f));
+    return shards_[sid]->GetFiberQueue()->Await(std::forward<F>(f));
   }
 
   // Uses a shard queue to dispatch. Callback runs in a dedicated fiber.
   template <typename F> auto Add(ShardId sid, F&& f) {
-    assert(sid < shard_queue_.size());
-    return shard_queue_[sid]->Add(std::forward<F>(f));
+    assert(sid < size_);
+    return shards_[sid]->GetFiberQueue()->Add(std::forward<F>(f));
+  }
+
+  template <typename F> auto AddL2(ShardId sid, F&& f) {
+    return shards_[sid]->GetSecondaryQueue()->Add(std::forward<F>(f));
   }
 
   // Runs a brief function on all shards. Waits for it to complete.
+  // `func` must not preempt.
   template <typename U> void RunBriefInParallel(U&& func) const {
     RunBriefInParallel(std::forward<U>(func), [](auto i) { return true; });
   }
 
   // Runs a brief function on selected shards. Waits for it to complete.
+  // `func` must not preempt.
   template <typename U, typename P> void RunBriefInParallel(U&& func, P&& pred) const;
 
-  template <typename U> void RunBlockingInParallel(U&& func);
+  // Runs a possibly blocking function on all shards. Waits for it to complete.
+  template <typename U> void RunBlockingInParallel(U&& func) {
+    RunBlockingInParallel(std::forward<U>(func), [](auto i) { return true; });
+  }
+
+  // Runs a possibly blocking function on selected shards. Waits for it to complete.
+  template <typename U, typename P> void RunBlockingInParallel(U&& func, P&& pred);
+
+  // Runs func on all shards via the same shard queue that's been used by transactions framework.
+  // The functions running inside the shard queue run atomically (sequentially)
+  // with respect each other on the same shard.
+  template <typename U> void AwaitRunningOnShardQueue(U&& func) {
+    util::fb2::BlockingCounter bc(size_);
+    for (size_t i = 0; i < size_; ++i) {
+      Add(i, [&func, bc]() mutable {
+        func(EngineShard::tlocal());
+        bc->Dec();
+      });
+    }
+
+    bc->Wait();
+  }
 
   // Used in tests
-  void TEST_EnableHeartBeat();
   void TEST_EnableCacheMode();
 
  private:
-  void InitThreadLocal(util::ProactorBase* pb, bool update_db_time);
-
+  void InitThreadLocal(util::ProactorBase* pb);
   util::ProactorPool* pp_;
-  std::vector<util::fibers_ext::FiberQueue*> shard_queue_;
+  std::unique_ptr<EngineShard*[]> shards_;
+  uint32_t size_ = 0;
 };
 
 template <typename U, typename P>
 void EngineShardSet::RunBriefInParallel(U&& func, P&& pred) const {
-  util::fibers_ext::BlockingCounter bc{0};
+  util::fb2::BlockingCounter bc{0};
 
   for (uint32_t i = 0; i < size(); ++i) {
     if (!pred(i))
       continue;
 
-    bc.Add(1);
+    bc->Add(1);
     util::ProactorBase* dest = pp_->at(i);
-    dest->DispatchBrief([f = std::forward<U>(func), bc]() mutable {
-      f(EngineShard::tlocal());
-      bc.Dec();
+    dest->DispatchBrief([&func, bc]() mutable {
+      func(EngineShard::tlocal());
+      bc->Dec();
     });
   }
-  bc.Wait();
+  bc->Wait();
 }
 
-template <typename U> void EngineShardSet::RunBlockingInParallel(U&& func) {
-  util::fibers_ext::BlockingCounter bc{size()};
+template <typename U, typename P> void EngineShardSet::RunBlockingInParallel(U&& func, P&& pred) {
+  util::fb2::BlockingCounter bc{0};
+  static_assert(std::is_invocable_v<U, EngineShard*>,
+                "Argument must be invocable EngineShard* as argument.");
+  static_assert(std::is_void_v<std::invoke_result_t<U, EngineShard*>>,
+                "Callable must not have a return value!");
 
   for (uint32_t i = 0; i < size(); ++i) {
+    if (!pred(i))
+      continue;
+
+    bc->Add(1);
     util::ProactorBase* dest = pp_->at(i);
-    dest->Dispatch([func, bc]() mutable {
+
+    // the "Dispatch" call spawns a fiber underneath.
+    dest->Dispatch([&func, bc]() mutable {
       func(EngineShard::tlocal());
-      bc.Dec();
+      bc->Dec();
     });
   }
-  bc.Wait();
+  bc->Wait();
 }
 
-inline ShardId Shard(std::string_view v, ShardId shard_num) {
-  XXH64_hash_t hash = XXH64(v.data(), v.size(), 120577240643ULL);
-  return hash % shard_num;
-}
+ShardId Shard(std::string_view v, ShardId shard_num);
 
+// absl::GetCurrentTimeNanos is twice faster than clock_gettime(CLOCK_REALTIME) on my laptop
+// and 4 times faster than on a VM. it takes 5-10ns to do a call.
+
+extern uint64_t TEST_current_time_ms;
+
+inline uint64_t GetCurrentTimeMs() {
+  return TEST_current_time_ms ? TEST_current_time_ms : absl::GetCurrentTimeNanos() / 1000000;
+}
 
 extern EngineShardSet* shard_set;
 

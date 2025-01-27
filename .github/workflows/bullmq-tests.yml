@@ -1,0 +1,50 @@
+# These tests are disabled until Dragonfly works well with BullMQ.
+name: bullmq-tests
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Build
+
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/romange/alpine-dev:latest
+      options: --security-opt seccomp=unconfined
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install NodeJs
+        run: |
+          apk add --no-cache nodejs npm yarn
+          node --version
+          npm --version
+          yarn --version
+          mkdir -p $GITHUB_WORKSPACE/build
+      - name: Configure/Build
+        run: |
+          cd $GITHUB_WORKSPACE/build
+          cmake .. -DCMAKE_BUILD_TYPE=Debug -GNinja
+          ninja dragonfly
+          ./dragonfly --alsologtostderr &
+
+      - name: Clone and build BullMQ
+        run: |
+          git clone https://github.com/taskforcesh/bullmq.git
+          cd bullmq
+          pwd
+          yarn install --ignore-engines --frozen-lockfile --non-interactive
+          yarn build
+      - name: Test BullMQ
+        run: |
+          cd $GITHUB_WORKSPACE/bullmq
+          # yarn test -i -g "should process delayed jobs with several workers respecting delay"

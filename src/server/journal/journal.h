@@ -1,11 +1,10 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
 #pragma once
-
-#include "server/common.h"
-#include "server/table.h"
+#include "server/journal/types.h"
+#include "util/fibers/detail/fiber_interface.h"
 #include "util/proactor_pool.h"
 
 namespace dfly {
@@ -14,59 +13,57 @@ class Transaction;
 
 namespace journal {
 
-enum class Op : uint8_t {
-  NOOP = 0,
-  LOCK = 1,
-  UNLOCK = 2,
-  LOCK_SHARD = 3,
-  UNLOCK_SHARD = 4,
-  SCHED = 5,
-  VAL = 10,
-  DEL,
-  MSET,
-};
-
 class Journal {
  public:
   using Span = absl::Span<const std::string_view>;
 
   Journal();
 
-  std::error_code StartLogging(std::string_view dir);
+  void StartInThread();
 
-  // Returns true if journal has been active and changed its state to lameduck mode
-  // and false otherwise.
-  bool EnterLameDuck();  // still logs ongoing transactions but refuses to start new ones.
-
-  // Requires: journal is in lameduck mode.
   std::error_code Close();
 
-  // Returns true if transaction was scheduled, false if journal is inactive
-  // or in lameduck mode and does not log new transactions.
-  bool SchedStartTx(TxId txid, unsigned num_keys, unsigned num_shards);
+  //******* The following functions must be called in the context of the owning shard *********//
 
-  void AddCmd(TxId txid, Op opcode, Span args) {
-    OpArgs(txid, opcode, args);
-  }
+  uint32_t RegisterOnChange(ChangeCallback cb);
+  void UnregisterOnChange(uint32_t id);
+  bool HasRegisteredCallbacks() const;
 
-  void Lock(TxId txid, Span keys) {
-    OpArgs(txid, Op::LOCK, keys);
-  }
-
-  void Unlock(TxId txid, Span keys) {
-    OpArgs(txid, Op::UNLOCK, keys);
-  }
+  bool IsLSNInBuffer(LSN lsn) const;
+  std::string_view GetEntry(LSN lsn) const;
 
   LSN GetLsn() const;
 
-  void RecordEntry(TxId txid, const PrimeKey& key, const PrimeValue& pval);
+  void RecordEntry(TxId txid, Op opcode, DbIndex dbid, unsigned shard_cnt,
+                   std::optional<SlotId> slot, Entry::Payload payload);
+
+  void SetFlushMode(bool allow_flush);
 
  private:
-  void OpArgs(TxId id, Op opcode, Span keys);
+  mutable util::fb2::Mutex state_mu_;
+};
 
-  mutable boost::fibers::mutex state_mu_;
+class JournalFlushGuard {
+ public:
+  explicit JournalFlushGuard(Journal* journal) : journal_(journal) {
+    if (journal_) {
+      journal_->SetFlushMode(false);
+    }
+    util::fb2::detail::EnterFiberAtomicSection();
+  }
 
-  std::atomic_bool lameduck_{false};
+  ~JournalFlushGuard() {
+    util::fb2::detail::LeaveFiberAtomicSection();
+    if (journal_) {
+      journal_->SetFlushMode(true);  // Restore the state on destruction
+    }
+  }
+
+  JournalFlushGuard(const JournalFlushGuard&) = delete;
+  JournalFlushGuard& operator=(const JournalFlushGuard&) = delete;
+
+ private:
+  Journal* journal_;
 };
 
 }  // namespace journal

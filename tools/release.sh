@@ -1,23 +1,37 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+RELEASE_DIR=build-release
+APP_PATH=$RELEASE_DIR/dragonfly
 
 set -e
 
-if ! [ -d helio ]; then
-   echo "could not find helio"
+if ! [ -f "helio/blaze.sh" ]; then
+   echo "ERROR"
+   echo "Could not find helio. Please only run this script from repo root."
+   echo "If you are already on the repo root, you might've cloned without submodules."
+   echo "Try running 'git submodule update --init --recursive'"
    exit 1
 fi
 
-ARCH=`uname -m`
-NAME="dragonfly-${ARCH}"
-
 pwd
-./helio/blaze.sh -release -DBoost_USE_STATIC_LIBS=ON -DOPENSSL_USE_STATIC_LIBS=ON \
-          -DENABLE_GIT_VERSION=ON -DWITH_UNWIND=OFF -DHELIO_RELEASE_FLAGS="-flto"
 
-cd build-opt 
-ninja dragonfly && ldd dragonfly
-./dragonfly --version
-mv dragonfly $NAME
-tar cvfz $NAME.unstripped.tar.gz $NAME ../LICENSE.md
-strip $NAME
-tar cvfz $NAME.tar.gz $NAME ../LICENSE.md
+make release
+
+if ! [ -f ${APP_PATH} ]; then
+   echo "ERROR"
+   echo "Failed to generate new dragonfly binary."
+   exit 1
+fi
+
+echo "Running ${APP_PATH} --version"
+${APP_PATH} --version
+
+if readelf -a ${APP_PATH} | grep GLIBC_PRIVATE >/dev/null 2>&1 ; then
+   echo "ERROR"
+   echo "The generated binary contain invalid GLIBC version entries."
+   exit 1
+fi
+
+make package
+echo "Release package created: "
+ls -lh $RELEASE_DIR/

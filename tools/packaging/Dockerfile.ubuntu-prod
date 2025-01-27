@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+FROM ghcr.io/romange/ubuntu-dev:20 as builder
+
+ARG TARGETPLATFORM
+
+WORKDIR /build
+COPY tools/docker/fetch_release.sh /tmp/
+COPY releases/dragonfly-* /tmp/
+
+RUN /tmp/fetch_release.sh ${TARGETPLATFORM}
+
+# Now prod image
+FROM ubuntu:22.04
+
+# ARG in fact change the env vars during the build process
+# ENV persist the env vars for the built image as well.
+ARG QEMU_CPU
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN --mount=type=tmpfs,target=/var/cache/apt \
+    --mount=type=tmpfs,target=/var/lib/apt/lists \
+    apt -q update && \
+    apt install -q -y --no-install-recommends netcat-openbsd ca-certificates redis-tools net-tools
+
+RUN groupadd -r -g 999 dfly && useradd -r -g dfly -u 999 dfly
+RUN mkdir /data && chown dfly:dfly /data
+
+VOLUME /data
+WORKDIR /data
+
+COPY tools/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY tools/docker/healthcheck.sh /usr/local/bin/healthcheck.sh
+COPY --from=builder /build/dragonfly /usr/local/bin/
+
+HEALTHCHECK CMD /usr/local/bin/healthcheck.sh
+ENTRYPOINT ["entrypoint.sh"]
+
+# For inter-container communication.
+EXPOSE 6379
+
+CMD ["dragonfly", "--logtostderr"]

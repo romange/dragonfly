@@ -2,29 +2,51 @@
 
 ## Running the server
 
-Dragonfly runs on linux. It uses relatively new linux specific [io-uring API](https://github.com/axboe/liburing)
-for I/O, hence it requires `Linux verion 5.10` or later.
-Debian/Bullseye, `Ubuntu 20.04.4` or later fit these requirements.
+Dragonfly runs on linux. We advise running it on linux version 5.11 or later
+but you can also run Dragonfly on older kernels as well.
 
-### WARNING: Building from source on older kernels WILL NOT WORK.
+> :warning: **Dragonfly releases are compiled with LTO (link time optimization)**:
+  Depending on the workload this can notably improve performance. If you want to
+  benchmark Dragonfly or use it in production, you should enable LTO by giving
+  `blaze.sh` the `-DCMAKE_CXX_FLAGS="-flto"` argument.
 
-If your host machine does not have at least `Linux verion 5.10` or later, we suggest you choose a [Dockerized Quick Start](/docs/quick-start/).
+## Step 1 - install dependencies
 
+On Debian/Ubuntu:
 
-## Step 1
+```bash
+sudo apt install ninja-build libunwind-dev libboost-fiber-dev libssl-dev \
+     autoconf-archive libtool cmake g++ libzstd-dev bison libxml2-dev zlib1g-dev
+```
+
+On Fedora:
+
+```bash
+sudo dnf install -y automake boost-devel g++ git cmake libtool ninja-build libzstd-devel  \
+     openssl-devel libunwind-devel autoconf-archive patch bison libxml2-devel libstdc++-static
+```
+
+On openSUSE:
+
+```bash
+sudo zypper install automake boost-devel gcc-c++ git cmake libtool ninja libzstd-devel  \
+     openssl-devel libunwind-devel autoconf-archive patch bison libxml2-devel \
+     libboost_context-devel libboost_system-devel
+```
+
+On FreeBSD:
+
+```bash
+pkg install -y git bash cmake ninja libunwind boost-libs autoconf automake libtool gmake bison
+```
+
+## Step 2 - clone the project
 
 ```bash
 git clone --recursive https://github.com/dragonflydb/dragonfly && cd dragonfly
 ```
 
-## Step 2
-```bash
-# Install dependencies
-sudo apt install ninja-build libunwind-dev libboost-fiber-dev libssl-dev \
-     autoconf-archive libtool cmake g++
-```
-
-## Step 3
+## Step 3 - configure & build it
 
 ```bash
 # Configure the build
@@ -35,7 +57,8 @@ cd build-opt && ninja dragonfly
 
 ```
 
-## Step 4
+## Step 4 - voilà
+
 ```bash
 # Run
 ./dragonfly --alsologtostderr
@@ -58,7 +81,7 @@ OK
 1) "hello"
 127.0.0.1:6379> get hello
 "world"
-127.0.0.1:6379> 
+127.0.0.1:6379>
 ```
 
 ## Step 6

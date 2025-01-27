@@ -1,12 +1,26 @@
 version: '3.8'
 
+# To run redis exporter, run: docker compose --profile redis up
+# To run memcached and its exporter: docker compose --profile memcached up
+#
+# Note you may still need to disable/change scraping job configs
+# in prometheus.yml
+#
 volumes:
-  prometheus_data: {}
-  grafana_data: {}
+  prometheus_data:
+  grafana_data:
+  memcached_data:
 
 services:
+  change_vol_ownership:
+    image: alpine
+    user: root
+    volumes:
+      - memcached_data:/memcached
+    command: chown -R 11211:11211 /memcached
+
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:v3.0.0
     restart: always
     volumes:
       - ./prometheus:/etc/prometheus/
@@ -21,7 +35,22 @@ services:
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     depends_on:
-      - node-exporter
+      node-exporter:
+        condition: service_started
+      change_vol_ownership:
+        condition: service_completed_successfully
+
+  memcached:
+    image: memcached
+    restart: unless-stopped
+    ports:
+      - "11211:11211"
+    command: "-t 8 -m 10000 -c 10000 --pidfile=/memcached/memcached.pid"
+    pid: host
+    volumes:
+      - memcached_data:/memcached
+    profiles: [memcached]
+
 
   node-exporter:
     image: prom/node-exporter
@@ -41,12 +70,14 @@ services:
       mode: global
 
   grafana:
-    image: grafana/grafana
+    image: grafana/grafana:10.1.10
     user: '472'
     restart: always
     environment:
       # do not really need it, just to leave it as an example on how to install plugins here
-      GF_INSTALL_PLUGINS: 'grafana-clock-panel'
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+      - GF_RENDERING_SERVER_URL=http://renderer:8081/render
+      - GF_RENDERING_CALLBACK_URL=http://grafana:3000/
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning/:/etc/grafana/provisioning/
@@ -56,3 +87,35 @@ services:
       - 3000:3000
     depends_on:
       - prometheus
+
+  memcached-exporter:
+    image: prom/memcached-exporter
+    container_name: memcached-exporter
+    restart: unless-stopped
+    ports:
+      - "9150:9150"
+    pid: host
+    command:
+      - --memcached.address=memcached:11211
+      - --memcached.pid-file=/memcached/memcached.pid
+    volumes:
+      - memcached_data:/memcached
+    profiles: [memcached]
+    depends_on:
+      - memcached
+
+  redis-exporter:
+    image: quay.io/oliver006/redis_exporter
+    profiles: [redis]
+    ports:
+      - 9121:9121
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+    environment:
+      - REDIS_ADDR=host.docker.internal:6379
+
+  renderer:
+    image: grafana/grafana-image-renderer:latest
+    ports:
+      - 8081

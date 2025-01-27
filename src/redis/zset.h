@@ -10,7 +10,7 @@
 /* Input flags. */
 #define ZADD_IN_NONE 0
 #define ZADD_IN_INCR (1 << 0) /* Increment the score instead of setting it. */
-#define ZADD_IN_NX (1 << 1)   /* Don't touch elements not already existing. */
+#define ZADD_IN_NX (1 << 1)   /* Don't touch elements already existing. */
 #define ZADD_IN_XX (1 << 2)   /* Only touch elements already existing. */
 #define ZADD_IN_GT (1 << 3)   /* Only update existing when new scores are higher. */
 #define ZADD_IN_LT (1 << 4)   /* Only update existing when new scores are lower. */
@@ -20,6 +20,8 @@
 #define ZADD_OUT_NAN (1 << 1)     /* Only touch elements already existing. */
 #define ZADD_OUT_ADDED (1 << 2)   /* The element was new and was added. */
 #define ZADD_OUT_UPDATED (1 << 3) /* The element already existed, score updated. */
+
+typedef struct dict dict;
 
 /* ZSETs use a specialized version of Skiplists */
 typedef struct zskiplistNode {
@@ -37,13 +39,6 @@ typedef struct zskiplist {
   unsigned long length;
   int level;
 } zskiplist;
-
-struct dict;
-
-typedef struct zset {
-  struct dict* dict;
-  zskiplist* zsl;
-} zset;
 
 /* Struct to hold an inclusive/exclusive range spec by score comparison. */
 typedef struct {
@@ -63,22 +58,14 @@ zskiplist* zslCreate(void);
 void zslFree(zskiplist* zsl);
 zskiplistNode* zslInsert(zskiplist* zsl, double score, sds ele);
 unsigned char* zzlInsert(unsigned char* zl, sds ele, double score);
-// int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node);
+int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node);
 zskiplistNode* zslFirstInRange(zskiplist* zsl, const zrangespec* range);
 zskiplistNode* zslLastInRange(zskiplist* zsl, const zrangespec* range);
-// double zzlGetScore(unsigned char *sptr);
-// void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
-// void zzlPrev(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
+zskiplistNode *zslUpdateScore(zskiplist *zsl, double curscore, sds ele, double newscore);
+unsigned char *zzlFind(unsigned char *lp, sds ele, double *score);
 unsigned char* zzlFirstInRange(unsigned char* zl, const zrangespec* range);
 unsigned char* zzlLastInRange(unsigned char* zl, const zrangespec* range);
-unsigned long zsetLength(const robj* zobj);
-void zsetConvert(robj* zobj, int encoding);
-void zsetConvertToZiplistIfNeeded(robj* zobj, size_t maxelelen);
-int zsetScore(robj* zobj, sds member, double* score);
 unsigned long zslGetRank(zskiplist *zsl, double score, sds ele);
-int zsetAdd(robj* zobj, double score, sds ele, int in_flags, int* out_flags, double* newscore);
-long zsetRank(robj* zobj, sds ele, int reverse);
-int zsetDel(robj* zobj, sds ele);
 
 void zzlPrev(unsigned char* zl, unsigned char** eptr, unsigned char** sptr);
 void zzlNext(unsigned char* zl, unsigned char** eptr, unsigned char** sptr);
@@ -95,7 +82,6 @@ int zzlLexValueGteMin(unsigned char* p, const zlexrangespec* spec);
 int zzlLexValueLteMax(unsigned char* p, const zlexrangespec* spec);
 int zslLexValueGteMin(sds value, const zlexrangespec* spec);
 int zslLexValueLteMax(sds value, const zlexrangespec* spec);
-int zsetZiplistValidateIntegrity(unsigned char* zl, size_t size, int deep);
 zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank);
 unsigned long zslDeleteRangeByRank(zskiplist *zsl, unsigned int start, unsigned int end,
                                    dict *dict);
@@ -108,5 +94,8 @@ unsigned char *zzlDeleteRangeByLex(unsigned char *zl, const zlexrangespec *range
 
 extern sds cmaxstring;
 extern sds cminstring;
+
+#define ZSKIPLIST_MAXLEVEL 32 /* Should be enough for 2^64 elements */
+#define ZSKIPLIST_P 0.25      /* Skiplist P = 1/4 */
 
 #endif

@@ -1,4 +1,4 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -7,29 +7,39 @@ extern "C" {
 #include "redis/zmalloc.h"
 }
 
-#include <absl/flags/reflection.h>
 #include <absl/strings/ascii.h>
+#include <absl/strings/charconv.h>
 #include <absl/strings/str_join.h>
 #include <absl/strings/strip.h>
+#include <fast_float/fast_float.h>
 #include <gmock/gmock.h>
 
+#include "base/flags.h"
 #include "base/gtest.h"
 #include "base/logging.h"
 #include "facade/facade_test.h"
 #include "server/conn_context.h"
 #include "server/main_service.h"
 #include "server/test_utils.h"
-#include "util/uring/uring_pool.h"
+
+ABSL_DECLARE_FLAG(float, mem_defrag_threshold);
+ABSL_DECLARE_FLAG(float, mem_defrag_waste_threshold);
+ABSL_DECLARE_FLAG(uint32_t, mem_defrag_check_sec_interval);
+ABSL_DECLARE_FLAG(std::vector<std::string>, rename_command);
+ABSL_DECLARE_FLAG(bool, lua_resp2_legacy_float);
+ABSL_DECLARE_FLAG(double, eviction_memory_budget_threshold);
 
 namespace dfly {
 
 using namespace std;
 using namespace util;
+using absl::SetFlag;
 using absl::StrCat;
+using fb2::Fiber;
 using ::io::Result;
+using testing::AnyOf;
 using testing::ElementsAre;
 using testing::HasSubstr;
-namespace this_fiber = boost::this_fiber;
 
 namespace {
 
@@ -37,8 +47,10 @@ constexpr unsigned kPoolThreadCount = 4;
 
 const char kKey1[] = "x";
 const char kKey2[] = "b";
-const char kKey3[] = "c";
-const char kKey4[] = "y";
+
+const char kKeySid0[] = "x";
+const char kKeySid1[] = "c";
+const char kKeySid2[] = "b";
 
 }  // namespace
 
@@ -50,6 +62,23 @@ class DflyEngineTest : public BaseFamilyTest {
     num_threads_ = kPoolThreadCount;
   }
 };
+
+class DflyEngineTestWithRegistry : public BaseFamilyTest {
+ protected:
+  DflyEngineTestWithRegistry() : BaseFamilyTest() {
+    num_threads_ = kPoolThreadCount;
+    ResetService();
+  }
+};
+
+class SingleThreadDflyEngineTest : public BaseFamilyTest {
+ protected:
+  SingleThreadDflyEngineTest() : BaseFamilyTest() {
+    num_threads_ = 1;
+  }
+};
+
+class DefragDflyEngineTest : public SingleThreadDflyEngineTest {};
 
 // TODO: to implement equivalent parsing in redis parser.
 TEST_F(DflyEngineTest, Sds) {
@@ -79,219 +108,44 @@ TEST_F(DflyEngineTest, Sds) {
   sdsfreesplitres(argv, argc);
 }
 
-TEST_F(DflyEngineTest, Multi) {
-  RespExpr resp = Run({"multi"});
-  ASSERT_EQ(resp, "OK");
+class DflyRenameCommandTest : public DflyEngineTest {
+ protected:
+  DflyRenameCommandTest() : DflyEngineTest() {
+    // rename flushall to myflushall, flushdb command will not be able to execute
+    absl::SetFlag(
+        &FLAGS_rename_command,
+        std::vector<std::string>({"flushall=myflushall", "flushdb=", "ping=abcdefghijklmnop"}));
+  }
 
-  resp = Run({"get", kKey1});
-  ASSERT_EQ(resp, "QUEUED");
+  void TearDown() {
+    absl::SetFlag(&FLAGS_rename_command, std::vector<std::string>({""}));
+    DflyEngineTest::TearDown();
+  }
+};
 
-  resp = Run({"get", kKey4});
-  ASSERT_EQ(resp, "QUEUED");
+TEST_F(DflyRenameCommandTest, RenameCommand) {
+  Run({"set", "a", "1"});
+  ASSERT_EQ(1, CheckedInt({"dbsize"}));
+  // flushall should not execute anything and should return error, as it was renamed.
+  ASSERT_THAT(Run({"flushall"}), ErrArg("unknown command `FLUSHALL`"));
 
-  resp = Run({"exec"});
-  ASSERT_THAT(resp, ArrLen(2));
-  ASSERT_THAT(resp.GetVec(), ElementsAre(ArgType(RespExpr::NIL), ArgType(RespExpr::NIL)));
+  ASSERT_EQ(1, CheckedInt({"dbsize"}));
 
-  atomic_bool tx_empty = true;
+  ASSERT_EQ(Run({"myflushall"}), "OK");
 
-  shard_set->RunBriefInParallel([&](EngineShard* shard) {
-    if (!shard->txq()->Empty())
-      tx_empty.store(false);
-  });
-  EXPECT_TRUE(tx_empty);
+  ASSERT_EQ(0, CheckedInt({"dbsize"}));
 
-  resp = Run({"get", kKey4});
-  ASSERT_THAT(resp, ArgType(RespExpr::NIL));
+  ASSERT_THAT(Run({"flushdb", "0"}), ErrArg("unknown command `FLUSHDB`"));
 
-  ASSERT_FALSE(service_->IsLocked(0, kKey1));
-  ASSERT_FALSE(service_->IsLocked(0, kKey4));
-  ASSERT_FALSE(service_->IsShardSetLocked());
+  ASSERT_THAT(Run({""}), ErrArg("unknown command ``"));
+
+  ASSERT_THAT(Run({"ping"}), ErrArg("unknown command `PING`"));
+  ASSERT_THAT(Run({"abcdefghijklmnop"}), "PONG");
 }
 
-TEST_F(DflyEngineTest, MultiEmpty) {
-  RespExpr resp = Run({"multi"});
-  ASSERT_EQ(resp, "OK");
-  resp = Run({"exec"});
-
-  ASSERT_THAT(resp, ArrLen(0));
-  ASSERT_FALSE(service_->IsShardSetLocked());
-
-  Run({"multi"});
-  ASSERT_EQ(Run({"ping", "foo"}), "QUEUED");
-  resp = Run({"exec"});
-  // one cell arrays are promoted to respexpr.
-  EXPECT_EQ(resp, "foo");
-}
-
-TEST_F(DflyEngineTest, MultiSeq) {
-  RespExpr resp = Run({"multi"});
-  ASSERT_EQ(resp, "OK");
-
-  resp = Run({"set", kKey1, absl::StrCat(1)});
-  ASSERT_EQ(resp, "QUEUED");
-  resp = Run({"get", kKey1});
-  ASSERT_EQ(resp, "QUEUED");
-  resp = Run({"mget", kKey1, kKey4});
-  ASSERT_EQ(resp, "QUEUED");
-  resp = Run({"exec"});
-
-  ASSERT_FALSE(service_->IsLocked(0, kKey1));
-  ASSERT_FALSE(service_->IsLocked(0, kKey4));
-  ASSERT_FALSE(service_->IsShardSetLocked());
-
-  ASSERT_THAT(resp, ArrLen(3));
-  const auto& arr = resp.GetVec();
-  EXPECT_THAT(arr, ElementsAre("OK", "1", ArrLen(2)));
-
-  ASSERT_THAT(arr[2].GetVec(), ElementsAre("1", ArgType(RespExpr::NIL)));
-}
-
-TEST_F(DflyEngineTest, MultiConsistent) {
-  auto mset_fb = pp_->at(0)->LaunchFiber([&] {
-    for (size_t i = 1; i < 10; ++i) {
-      string base = StrCat(i * 900);
-      RespExpr resp = Run({"mset", kKey1, base, kKey4, base});
-      ASSERT_EQ(resp, "OK");
-    }
-  });
-
-  auto fb = pp_->at(1)->LaunchFiber([&] {
-    RespExpr resp = Run({"multi"});
-    ASSERT_EQ(resp, "OK");
-    this_fiber::sleep_for(1ms);
-
-    resp = Run({"get", kKey1});
-    ASSERT_EQ(resp, "QUEUED");
-
-    resp = Run({"get", kKey4});
-    ASSERT_EQ(resp, "QUEUED");
-
-    resp = Run({"mget", kKey4, kKey1});
-    ASSERT_EQ(resp, "QUEUED");
-
-    resp = Run({"exec"});
-    ASSERT_THAT(resp, ArrLen(3));
-    const RespVec& resp_arr = resp.GetVec();
-    ASSERT_THAT(resp_arr, ElementsAre(ArgType(RespExpr::STRING), ArgType(RespExpr::STRING),
-                                      ArgType(RespExpr::ARRAY)));
-    ASSERT_EQ(resp_arr[0].GetBuf(), resp_arr[1].GetBuf());
-    const RespVec& sub_arr = resp_arr[2].GetVec();
-    EXPECT_THAT(sub_arr, ElementsAre(ArgType(RespExpr::STRING), ArgType(RespExpr::STRING)));
-    EXPECT_EQ(sub_arr[0].GetBuf(), sub_arr[1].GetBuf());
-    EXPECT_EQ(sub_arr[0].GetBuf(), resp_arr[0].GetBuf());
-  });
-
-  mset_fb.join();
-  fb.join();
-  ASSERT_FALSE(service_->IsLocked(0, kKey1));
-  ASSERT_FALSE(service_->IsLocked(0, kKey4));
-  ASSERT_FALSE(service_->IsShardSetLocked());
-}
-
-TEST_F(DflyEngineTest, MultiWeirdCommands) {
-  Run({"multi"});
-  ASSERT_EQ(Run({"eval", "return 42", "0"}), "QUEUED");
-  EXPECT_THAT(Run({"exec"}), IntArg(42));
-}
-
-TEST_F(DflyEngineTest, MultiRename) {
-  RespExpr resp = Run({"multi"});
-  ASSERT_EQ(resp, "OK");
-  Run({"set", kKey1, "1"});
-
-  resp = Run({"rename", kKey1, kKey4});
-  ASSERT_EQ(resp, "QUEUED");
-  resp = Run({"exec"});
-
-  ASSERT_THAT(resp, ArrLen(2));
-  EXPECT_THAT(resp.GetVec(), ElementsAre("OK", "OK"));
-  ASSERT_FALSE(service_->IsLocked(0, kKey1));
-  ASSERT_FALSE(service_->IsLocked(0, kKey4));
-  ASSERT_FALSE(service_->IsShardSetLocked());
-}
-
-TEST_F(DflyEngineTest, MultiHop) {
-  Run({"set", kKey1, "1"});
-
-  auto p1_fb = pp_->at(1)->LaunchFiber([&] {
-    for (int i = 0; i < 100; ++i) {
-      auto resp = Run({"rename", kKey1, kKey2});
-      ASSERT_EQ(resp, "OK");
-      EXPECT_EQ(2, GetDebugInfo("IO1").shards_count);
-
-      resp = Run({"rename", kKey2, kKey1});
-      ASSERT_EQ(resp, "OK");
-    }
-  });
-
-  // mset should be executed either as ooo or via tx-queue because previous transactions
-  // have been unblocked and executed as well. In other words, this mset should never block
-  // on serializability constraints.
-  auto p2_fb = pp_->at(2)->LaunchFiber([&] {
-    for (int i = 0; i < 100; ++i) {
-      Run({"mset", kKey3, "1", kKey4, "2"});
-    }
-  });
-
-  p1_fb.join();
-  p2_fb.join();
-}
-
-TEST_F(DflyEngineTest, FlushDb) {
-  Run({"mset", kKey1, "1", kKey4, "2"});
-  auto resp = Run({"flushdb"});
-  ASSERT_EQ(resp, "OK");
-
-  auto fb0 = pp_->at(0)->LaunchFiber([&] {
-    for (unsigned i = 0; i < 100; ++i) {
-      Run({"flushdb"});
-    }
-  });
-
-  pp_->at(1)->Await([&] {
-    for (unsigned i = 0; i < 100; ++i) {
-      Run({"mset", kKey1, "1", kKey4, "2"});
-      int64_t ival = CheckedInt({"exists", kKey1, kKey4});
-      ASSERT_TRUE(ival == 0 || ival == 2) << i << " " << ival;
-    }
-  });
-
-  fb0.join();
-
-  ASSERT_FALSE(service_->IsLocked(0, kKey1));
-  ASSERT_FALSE(service_->IsLocked(0, kKey4));
-  ASSERT_FALSE(service_->IsShardSetLocked());
-}
-
-TEST_F(DflyEngineTest, Eval) {
-  auto resp = Run({"incrby", "foo", "42"});
-  EXPECT_THAT(resp, IntArg(42));
-
-  resp = Run({"eval", "return redis.call('get', 'foo')", "0"});
-  EXPECT_THAT(resp, ErrArg("undeclared"));
-
-  resp = Run({"eval", "return redis.call('get', 'foo')", "1", "bar"});
-  EXPECT_THAT(resp, ErrArg("undeclared"));
-
-  ASSERT_FALSE(service_->IsLocked(0, "foo"));
-
-  resp = Run({"eval", "return redis.call('get', 'foo')", "1", "foo"});
-  EXPECT_THAT(resp, "42");
-
-  resp = Run({"eval", "return redis.call('get', KEYS[1])", "1", "foo"});
-  EXPECT_THAT(resp, "42");
-
-  ASSERT_FALSE(service_->IsLocked(0, "foo"));
-  ASSERT_FALSE(service_->IsShardSetLocked());
-
-  resp = Run({"eval", "return 77", "2", "foo", "zoo"});
-  EXPECT_THAT(resp, IntArg(77));
-
-  // a,b important here to spawn multiple shards.
-  resp = Run({"eval", "return redis.call('exists', KEYS[2])", "2", "a", "b"});
-  EXPECT_EQ(2, GetDebugInfo().shards_count);
-  EXPECT_THAT(resp, IntArg(0));
+TEST_F(SingleThreadDflyEngineTest, GlobalSingleThread) {
+  Run({"set", "a", "1"});
+  Run({"move", "a", "1"});
 }
 
 TEST_F(DflyEngineTest, EvalResp) {
@@ -301,6 +155,11 @@ TEST_F(DflyEngineTest, EvalResp) {
   resp = Run({"eval", "return {5, 'foo', 17.5}", "0"});
   ASSERT_THAT(resp, ArrLen(3));
   EXPECT_THAT(resp.GetVec(), ElementsAre(IntArg(5), "foo", "17.5"));
+
+  resp = Run({"eval", "return {map={a=1,b=2}}", "0"});
+  ASSERT_THAT(resp, ArrLen(4));
+  EXPECT_THAT(resp.GetVec(), AnyOf(ElementsAre("a", IntArg(1), "b", IntArg(2)),
+                                   ElementsAre("b", IntArg(2), "a", IntArg(1))));
 }
 
 TEST_F(DflyEngineTest, EvalPublish) {
@@ -339,6 +198,59 @@ return {offset, epoch}
   EXPECT_THAT(resp.GetVec(), ElementsAre(IntArg(1), "6"));
 }
 
+// Scenario: 1. a lua call A schedules itself on shards 0, 1, 2.
+//           2. another lua call B schedules itself on shards 1,2 but on shard 1 (or 2) it
+//              schedules itself before A.
+//              the order of scheduling: shard 0: A, shard 1: B, A. shard 2: B, A.
+//           3. A is executes its first command first, which coincendently runs only on shard 0,
+//              hence A finishes before B and then it tries to cleanup.
+//           4. There was an incorrect cleanup of multi-transactions that breaks for shard 1 (or 2)
+//              because it assume the A is at front of the queue.
+TEST_F(DflyEngineTest, EvalBug713) {
+  const char* script = "return redis.call('get', KEYS[1])";
+
+  // A
+  auto fb0 = pp_->at(1)->LaunchFiber([&] {
+    ThisFiber::Yield();
+    for (unsigned i = 0; i < 50; ++i) {
+      Run({"eval", script, "3", kKeySid0, kKeySid1, kKeySid2});
+    }
+  });
+
+  // B
+  for (unsigned j = 0; j < 50; ++j) {
+    Run({"eval", script, "2", kKeySid1, kKeySid2});
+  }
+  fb0.Join();
+}
+
+// Tests deadlock that happenned due to a fact that trans->Schedule was called
+// before interpreter->Lock().
+//
+// The problematic scenario:
+// 1. transaction 1 schedules itself and blocks on an interpreter lock
+// 2. transaction 2 schedules itself, but meanwhile an interpreter unlocks itself and
+//    transaction 2 grabs the lock but can not progress due to transaction 1 already
+//    scheduled before.
+TEST_F(DflyEngineTest, EvalBug713b) {
+  const char* script = "return redis.call('get', KEYS[1])";
+
+  const uint32_t kNumFibers = 20;
+  Fiber fibers[kNumFibers];
+
+  for (unsigned j = 0; j < kNumFibers; ++j) {
+    fibers[j] = pp_->at(1)->LaunchFiber([j, script, this] {
+      for (unsigned i = 0; i < 50; ++i) {
+        Run(StrCat("fb", j), {"eval", script, "3", kKeySid0, kKeySid1, kKeySid2});
+      }
+    });
+  }
+
+  for (unsigned j = 0; j < kNumFibers; ++j) {
+    fibers[j].Join();
+  }
+}
+
 TEST_F(DflyEngineTest, EvalSha) {
   auto resp = Run({"script", "load", "return 5"});
   EXPECT_THAT(resp, ArgType(RespExpr::STRING));
@@ -362,23 +274,65 @@ TEST_F(DflyEngineTest, EvalSha) {
   EXPECT_THAT(resp, "c6459b95a0e81df97af6fdd49b1a9e0287a57363");
 }
 
-TEST_F(DflyEngineTest, Hello) {
+TEST_F(DflyEngineTest, ScriptFlush) {
+  auto resp = Run({"script", "load", "return 5"});
+  EXPECT_THAT(resp, ArgType(RespExpr::STRING));
+  string sha{ToSV(resp.GetBuf())};
+  resp = Run({"evalsha", sha, "0"});
+  EXPECT_THAT(5, resp.GetInt());
+  resp = Run({"script", "exists", sha});
+  EXPECT_THAT(1, resp.GetInt());
+
+  resp = Run({"script", "flush"});
+  resp = Run({"script", "exists", sha});
+  EXPECT_THAT(0, resp.GetInt());
+  EXPECT_THAT(Run({"evalsha", sha, "0"}), ErrArg("NOSCRIPT No matching script. Please use EVAL."));
+
+  resp = Run({"script", "load", "return 5"});
+  EXPECT_THAT(resp, ArgType(RespExpr::STRING));
+  sha = string{ToSV(resp.GetBuf())};
+  resp = Run({"evalsha", sha, "0"});
+  EXPECT_THAT(5, resp.GetInt());
+  resp = Run({"script", "exists", sha});
+  EXPECT_THAT(1, resp.GetInt());
+}
+
+TEST_F(DflyEngineTestWithRegistry, Hello) {
   auto resp = Run({"hello"});
-  ASSERT_THAT(resp, ArrLen(12));
+  ASSERT_THAT(resp, ArrLen(14));
   resp = Run({"hello", "2"});
-  ASSERT_THAT(resp, ArrLen(12));
+  ASSERT_THAT(resp, ArrLen(14));
 
-  EXPECT_THAT(resp.GetVec(), ElementsAre("server", "redis", "version", ArgType(RespExpr::STRING),
-                                         "proto", IntArg(2), "id", ArgType(RespExpr::INT64), "mode",
-                                         "standalone", "role", "master"));
-
-  // These are valid arguments to HELLO, however as they are not yet supported the implementation
-  // is degraded to 'unknown command'.
-  EXPECT_THAT(Run({"hello", "3"}),
-              ErrArg("ERR unknown command 'HELLO' with args beginning with: `3`"));
   EXPECT_THAT(
-      Run({"hello", "2", "AUTH", "uname", "pwd"}),
-      ErrArg("ERR unknown command 'HELLO' with args beginning with: `2`, `AUTH`, `uname`, `pwd`"));
+      resp.GetVec(),
+      ElementsAre("server", "redis", "version", "7.4.0", "dragonfly_version",
+                  ArgType(RespExpr::STRING), "proto", IntArg(2), "id", ArgType(RespExpr::INT64),
+                  "mode", testing::AnyOf("standalone", "cluster"), "role", "master"));
+
+  resp = Run({"hello", "3"});
+  ASSERT_THAT(resp, ArrLen(14));
+  EXPECT_THAT(
+      resp.GetVec(),
+      ElementsAre("server", "redis", "version", "7.4.0", "dragonfly_version",
+                  ArgType(RespExpr::STRING), "proto", IntArg(3), "id", ArgType(RespExpr::INT64),
+                  "mode", testing::AnyOf("standalone", "cluster"), "role", "master"));
+
+  EXPECT_THAT(Run({"hello", "2", "AUTH", "uname", "pwd"}),
+              ErrArg("WRONGPASS invalid username-password pair or user is disabled."));
+
+  EXPECT_THAT(Run({"hello", "2", "AUTH", "default", "pwd"}),
+              ErrArg("WRONGPASS invalid username-password pair or user is disabled."));
+
+  resp = Run({"hello", "3", "AUTH", "default", ""});
+  ASSERT_THAT(resp, ErrArg("WRONGPASS invalid username-password pair or user is disabled."));
+
+  TestInitAclFam();
+
+  resp = Run({"hello", "3", "AUTH", "default", "tmp"});
+  ASSERT_THAT(resp, ArrLen(14));
+
+  resp = Run({"hello", "3", "AUTH", "default", "tmp", "SETNAME", "myname"});
+  ASSERT_THAT(resp, ArrLen(14));
 }
 
 TEST_F(DflyEngineTest, Memcache) {
@@ -414,6 +368,26 @@ TEST_F(DflyEngineTest, Memcache) {
   EXPECT_THAT(resp, ElementsAre("END"));
 }
 
+TEST_F(DflyEngineTest, MemcacheFlags) {
+  using MP = MemcacheParser;
+
+  auto resp = Run("resp", {"SET", "key", "bar", "_MCFLAGS", "42"});
+  ASSERT_EQ(resp, "OK");
+  MCResponse resp2 = RunMC(MP::GET, "key");
+  EXPECT_THAT(resp2, ElementsAre("VALUE key 42 3", "bar", "END"));
+
+  ASSERT_EQ(Run("resp", {"flushdb"}), "OK");
+  pp_->AwaitFiberOnAll([](auto*) {
+    if (auto* shard = EngineShard::tlocal(); shard) {
+      EXPECT_EQ(namespaces->GetDefaultNamespace()
+                    .GetDbSlice(shard->shard_id())
+                    .GetDBTable(0)
+                    ->mcflag.size(),
+                0u);
+    }
+  });
+}
+
 TEST_F(DflyEngineTest, LimitMemory) {
   mi_option_enable(mi_option_limit_os_alloc);
   string blob(128, 'a');
@@ -432,20 +406,19 @@ TEST_F(DflyEngineTest, FlushAll) {
     for (size_t i = 1; i < 100; ++i) {
       RespExpr resp = Run({"set", "foo", "bar"});
       ASSERT_EQ(resp, "OK");
-      this_fiber::yield();
+      ThisFiber::Yield();
     }
   });
 
-  fb0.join();
-  fb1.join();
+  fb0.Join();
+  fb1.Join();
 }
 
 TEST_F(DflyEngineTest, OOM) {
-  shard_set->TEST_EnableHeartBeat();
-  max_memory_limit = 0;
+  max_memory_limit = 300000;
   size_t i = 0;
   RespExpr resp;
-  for (; i < 5000; i += 3) {
+  for (; i < 10000; i += 3) {
     resp = Run({"mset", StrCat("key", i), "bar", StrCat("key", i + 1), "bar", StrCat("key", i + 2),
                 "bar"});
     if (resp != "OK")
@@ -466,7 +439,8 @@ TEST_F(DflyEngineTest, OOM) {
     run_args.push_back("bar");
 
     for (unsigned i = 0; i < 5000; ++i) {
-      run_args[1] = StrCat("key", cmd, i);
+      auto str = StrCat("key", cmd, i);
+      run_args[1] = str;
       resp = Run(run_args);
 
       if (resp.type == RespExpr::ERROR)
@@ -478,52 +452,82 @@ TEST_F(DflyEngineTest, OOM) {
   }
 }
 
+#ifndef SANITIZERS
 /// Reproduces the case where items with expiry data were evicted,
 /// and then written with the same key.
 TEST_F(DflyEngineTest, Bug207) {
-  shard_set->TEST_EnableHeartBeat();
+  max_memory_limit = 300000 * 4;
+
+  // The threshold is set to 0.3 to trigger eviction earlier and prevent OOM.
+  absl::FlagSaver fs;
+  absl::SetFlag(&FLAGS_eviction_memory_budget_threshold, 0.3);
+
   shard_set->TEST_EnableCacheMode();
 
-  max_memory_limit = 0;
+  /* The value should be large enough to avoid being inlined. Heartbeat evicts only objects for
+   * which HasAllocated() returns true. */
+  std::string value(1000, '.');
 
   ssize_t i = 0;
   RespExpr resp;
-  for (; i < 5000; ++i) {
-    resp = Run({"setex", StrCat("key", i), "30", "bar"});
-    // we evict some items because 5000 is too much when max_memory_limit is zero.
+  for (; i < 1000; ++i) {
+    resp = Run({"setex", StrCat("key", i), "30", value});
     ASSERT_EQ(resp, "OK");
   }
 
+  auto evicted_count = [](const string& str) -> size_t {
+    const string matcher = "evicted_keys:";
+    const auto pos = str.find(matcher) + matcher.size();
+    const auto sub = str.substr(pos, 1);
+    return atoi(sub.c_str());
+  };
+
+  resp = Run({"info", "stats"});
+  EXPECT_GT(evicted_count(resp.GetString()), 0);
+
   for (; i > 0; --i) {
     resp = Run({"setex", StrCat("key", i), "30", "bar"});
+    ASSERT_EQ(resp, "OK");
   }
 }
 
 TEST_F(DflyEngineTest, StickyEviction) {
-  shard_set->TEST_EnableHeartBeat();
+  max_memory_limit = 600000;  // 0.6mb
   shard_set->TEST_EnableCacheMode();
-  max_memory_limit = 0;
 
   string tmp_val(100, '.');
 
   ssize_t failed = -1;
   for (ssize_t i = 0; i < 5000; ++i) {
-    auto set_resp = Run({"set", StrCat("key", i), tmp_val});
-    auto stick_resp = Run({"stick", StrCat("key", i)});
+    string key = StrCat("volatile", i);
+    ASSERT_EQ("OK", Run({"set", key, tmp_val}));
+  }
 
-    if (set_resp != "OK") {
-      failed = i;
-      break;
+  bool done = false;
+  for (ssize_t i = 0; !done && i < 5000; ++i) {
+    string key = StrCat("key", i);
+    while (true) {
+      if (Run({"set", key, tmp_val}) != "OK") {
+        failed = i;
+        done = true;
+        break;
+      }
+
+      // Eviction could have happened right after set, before stick. If so, try again
+      if (Run({"stick", key}).GetInt() == 1) {
+        break;
+      }
     }
-    ASSERT_THAT(stick_resp, IntArg(1));
   }
 
   ASSERT_GE(failed, 0);
-  // Make sure neither of the sticky values was evicted
+  // Make sure none of the sticky values was evicted
   for (ssize_t i = 0; i < failed; ++i) {
     ASSERT_THAT(Run({"exists", StrCat("key", i)}), IntArg(1));
   }
 }
+
+#endif
 
 TEST_F(DflyEngineTest, PSubscribe) {
   single_response_ = false;
@@ -532,9 +536,11 @@ TEST_F(DflyEngineTest, PSubscribe) {
   resp = pp_->at(0)->Await([&] { return Run({"publish", "ab", "foo"}); });
   EXPECT_THAT(resp, IntArg(1));
 
+  pp_->AwaitFiberOnAll([](ProactorBase* pb) {});
+
   ASSERT_EQ(1, SubscriberMessagesLen("IO1"));
 
-  facade::Connection::PubMessage msg = GetPublishedMessage("IO1", 0);
+  const auto& msg = GetPublishedMessage("IO1", 0);
   EXPECT_EQ("foo", msg.message);
   EXPECT_EQ("ab", msg.channel);
   EXPECT_EQ("a*", msg.pattern);
@@ -575,8 +581,289 @@ TEST_F(DflyEngineTest, PUnsubscribe) {
   EXPECT_THAT(resp.GetVec(), ElementsAre("punsubscribe", "b*", IntArg(0)));
 }
 
+TEST_F(DflyEngineTest, Bug468) {
+  RespExpr resp = Run({"multi"});
+  ASSERT_EQ(resp, "OK");
+  resp = Run({"SET", "foo", "bar", "EX", "moo"});
+  ASSERT_EQ(resp, "QUEUED");
+
+  resp = Run({"exec"});
+  ASSERT_THAT(resp, ErrArg("not an integer"));
+
+  ASSERT_FALSE(IsLocked(0, "foo"));
+
+  resp = Run({"eval", "return redis.call('set', 'foo', 'bar', 'EX', 'moo')", "1", "foo"});
+  ASSERT_THAT(resp, ErrArg("not an integer"));
+
+  ASSERT_FALSE(IsLocked(0, "foo"));
+}
+
+TEST_F(DflyEngineTest, Bug496) {
+  shard_set->RunBlockingInParallel([](EngineShard* shard) {
+    auto& db = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+
+    int cb_hits = 0;
+    uint32_t cb_id =
+        db.RegisterOnChange([&cb_hits](DbIndex, const DbSlice::ChangeReq&) { cb_hits++; });
+
+    {
+      auto res = *db.AddOrFind({}, "key-1");
+      EXPECT_TRUE(res.is_new);
+      EXPECT_EQ(cb_hits, 1);
+    }
+
+    {
+      auto res = *db.AddOrFind({}, "key-1");
+      EXPECT_FALSE(res.is_new);
+      EXPECT_EQ(cb_hits, 2);
+    }
+
+    {
+      auto res = *db.AddOrFind({}, "key-2");
+      EXPECT_TRUE(res.is_new);
+      EXPECT_EQ(cb_hits, 3);
+    }
+
+    db.UnregisterOnChange(cb_id);
+  });
+}
+
+TEST_F(DflyEngineTest, Issue607) {
+  // https://github.com/dragonflydb/dragonfly/issues/607
+
+  Run({"SET", "key", "value1"});
+  EXPECT_EQ(Run({"GET", "key"}), "value1");
+
+  Run({"SET", "key", "value2"});
+  EXPECT_EQ(Run({"GET", "key"}), "value2");
+
+  Run({"EXPIRE", "key", "1000"});
+
+  Run({"SET", "key", "value3"});
+  EXPECT_EQ(Run({"GET", "key"}), "value3");
+}
+
+TEST_F(DflyEngineTest, Issue679) {
+  // https://github.com/dragonflydb/dragonfly/issues/679
+
+  Run({"HMSET", "a", "key", "val"});
+  Run({"EXPIRE", "a", "1000"});
+  Run({"HMSET", "a", "key", "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"});
+  Run({"EXPIRE", "a", "1001"});
+}
+
+TEST_F(DflyEngineTest, Issue742) {
+  // https://github.com/dragonflydb/dragonfly/issues/607
+  // The stack was not cleaned in case of an error and it blew up.
+  for (int i = 0; i < 3'000; i++) {
+    Run({"EVAL", "redis.get(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])", "5", "k1", "k2", "k3",
+         "k4", "k5"});
+  }
+}
+
+TEST_F(DefragDflyEngineTest, TestDefragOption) {
+  if (pp_->GetNextProactor()->GetKind() == util::ProactorBase::EPOLL) {
+    GTEST_SKIP() << "Defragmentation via idle task is only supported in io uring";
+  }
+
+  // mem_defrag_threshold is based on RSS statistic, but we don't count it in the test
+  absl::SetFlag(&FLAGS_mem_defrag_threshold, 0.0);
+  absl::SetFlag(&FLAGS_mem_defrag_check_sec_interval, 0);
+  absl::SetFlag(&FLAGS_mem_defrag_waste_threshold, 0.1);
+
+  //  Fill data into dragonfly and then check if we have
+  //  any location in memory to defrag. See issue #448 for details about this.
+  constexpr size_t kMaxMemoryForTest = 1'100'000;
+  constexpr int kNumberOfKeys = 1'000;  // this fill the memory
+  constexpr int kKeySize = 637;
+  constexpr int kMaxDefragTriesForTests = 30;
+  constexpr int kFactor = 4;
+
+  max_memory_limit = kMaxMemoryForTest;  // control memory size so no need for too many keys
+  std::vector<std::string> keys2delete;
+  keys2delete.push_back("del");
+
+  // create keys that we would like to remove, try to make it none adjusting locations
+  for (int i = 0; i < kNumberOfKeys; i += kFactor) {
+    keys2delete.push_back("key-name:" + std::to_string(i));
+  }
+
+  std::vector<std::string_view> keys(keys2delete.begin(), keys2delete.end());
+
+  Run({"SELECT", "2"});
+
+  RespExpr resp = Run(
+      {"DEBUG", "POPULATE", std::to_string(kNumberOfKeys), "key-name", std::to_string(kKeySize)});
+  ASSERT_EQ(resp, "OK");
+  auto r = CheckedInt({"DBSIZE"});
+
+  ASSERT_EQ(r, kNumberOfKeys);
+
+  shard_set->pool()->AwaitFiberOnAll([&](unsigned index, ProactorBase* base) {
+    EngineShard* shard = EngineShard::tlocal();
+    ASSERT_FALSE(shard == nullptr);  // we only have one and its should not be empty!
+    ThisFiber::SleepFor(100ms);
+
+    // make sure that the task that collect memory usage from all shard ran
+    // for at least once, and that no defrag was done yet.
+    auto stats = shard->stats();
+    for (int i = 0; i < 3; i++) {
+      ThisFiber::SleepFor(100ms);
+      EXPECT_EQ(stats.defrag_realloc_total, 0);
+    }
+  });
+
+  ArgSlice delete_cmd(keys);
+  r = CheckedInt(delete_cmd);
+  LOG(INFO) << "finish deleting memory entries " << r;
+  // the first element in this is the command del so size is one less
+  ASSERT_EQ(r, keys2delete.size() - 1);
+  // At this point we need to see whether we did running the task and whether the task did something
+  shard_set->pool()->AwaitFiberOnAll([&](unsigned index, ProactorBase* base) {
+    EngineShard* shard = EngineShard::tlocal();
+    ASSERT_TRUE(shard != nullptr);  // we only have one and its should not be empty!
+    // a "busy wait" to ensure that memory defragmentations was successful:
+    // the task ran and did it work
+    auto stats = shard->stats();
+    for (int i = 0; i < kMaxDefragTriesForTests && stats.defrag_realloc_total == 0; i++) {
+      stats = shard->stats();
+      ThisFiber::SleepFor(220ms);
+    }
+    // make sure that we successfully found places to defrag in memory
+    EXPECT_GT(stats.defrag_realloc_total, 0);
+    EXPECT_GE(stats.defrag_attempt_total, stats.defrag_realloc_total);
+  });
+}
+
+TEST_F(DflyEngineTest, Issue752) {
+  // https://github.com/dragonflydb/dragonfly/issues/752
+  // local_result_ member was not reset between commands
+  Run({"multi"});
+  auto resp = Run({"llen", kKey1});
+  ASSERT_EQ(resp, "QUEUED");
+  resp = Run({"del", kKey1, kKey2});
+  ASSERT_EQ(resp, "QUEUED");
+  resp = Run({"exec"});
+  ASSERT_THAT(resp, ArrLen(2));
+  ASSERT_THAT(resp.GetVec(), ElementsAre(IntArg(0), IntArg(0)));
+}
+
+TEST_F(DflyEngineTest, Latency) {
+  Run({"latency", "latest"});
+}
+
+TEST_F(DflyEngineTest, EvalBug2664) {
+  absl::FlagSaver fs;
+  absl::SetFlag(&FLAGS_lua_resp2_legacy_float, true);
+
+  auto resp = Run({"eval", "return 42.9", "0"});
+  EXPECT_THAT(resp, IntArg(42));
+  resp = Run({"eval", "return -3.8", "0"});
+  EXPECT_THAT(resp, IntArg(-3));
+
+  resp = Run({"hello", "3"});
+  ASSERT_THAT(resp, ArrLen(14));
+
+  resp = Run({"eval", "return 42.9", "0"});
+  EXPECT_THAT(resp, DoubleArg(42.9));
+}
+
+TEST_F(DflyEngineTest, MemoryUsage) {
+  for (unsigned i = 0; i < 1000; ++i) {
+    Run({"rpush", "l1", StrCat("val", i)});
+  }
+
+  for (unsigned i = 0; i < 1000; ++i) {
+    Run({"rpush", "l2", StrCat(string(200, 'a'), i)});
+  }
+  auto resp = Run({"memory", "usage", "l1"});
+  EXPECT_GT(*resp.GetInt(), 8000);
+
+  resp = Run({"memory", "usage", "l2"});
+  EXPECT_GT(*resp.GetInt(), 100000);
+}
+
+TEST_F(DflyEngineTest, DebugObject) {
+  Run({"set", "key", "value"});
+  Run({"lpush", "l1", "a", "b"});
+  Run({"sadd", "s1", "1", "2", "3"});
+  Run({"sadd", "s2", "a", "b", "c"});
+  Run({"zadd", "z1", "1", "a", "2", "b", "3", "c"});
+  Run({"hset", "h1", "a", "1", "b", "2", "c", "3"});
+  auto resp = Run({"debug", "object", "key"});
+  EXPECT_THAT(resp.GetString(), HasSubstr("encoding:raw"));
+  resp = Run({"debug", "object", "l1"});
+  EXPECT_THAT(resp.GetString(), HasSubstr("encoding:quicklist"));
+  resp = Run({"debug", "object", "s1"});
+  EXPECT_THAT(resp.GetString(), HasSubstr("encoding:intset"));
+  resp = Run({"debug", "object", "s2"});
+  EXPECT_THAT(resp.GetString(), HasSubstr("encoding:dense_set"));
+  resp = Run({"debug", "object", "z1"});
+  EXPECT_THAT(resp.GetString(), HasSubstr("encoding:listpack"));
+}
+
+TEST_F(DflyEngineTest, StreamMemInfo) {
+  for (int i = 1; i < 2; ++i) {
+    Run({"XADD", "test", std::to_string(i), "var", "val" + std::to_string(i)});
+  }
+
+  int64_t stream_mem_first = GetMetrics().db_stats[0].memory_usage_by_type[OBJ_STREAM];
+  EXPECT_GT(stream_mem_first, 0);
+
+  auto dump = Run({"dump", "test"});
+  Run({"del", "test"});
+  Run({"restore", "test", "0", facade::ToSV(dump.GetBuf())});
+
+  int64_t stream_mem_second = GetMetrics().db_stats[0].memory_usage_by_type[OBJ_STREAM];
+
+  // stream_mem_first != stream_mem_second due to a preallocation in XADD command (see
+  // STREAM_LISTPACK_MAX_PRE_ALLOCATE)
+  EXPECT_GT(stream_mem_second, 0);
+}
+
+TEST_F(DflyEngineTest, ReplicaofRejectOnLoad) {
+  service_->SwitchState(GlobalState::ACTIVE, GlobalState::LOADING);
+
+  RespExpr res = Run({"REPLICAOF", "localhost", "3779"});
+
+  ASSERT_THAT(res, ErrArg("LOADING Dragonfly is loading the dataset in memory"));
+}
+
 // TODO: to test transactions with a single shard since then all transactions become local.
 // To consider having a parameter in dragonfly engine controlling number of shards
 // unconditionally from number of cpus. TO TEST BLPOP under multi for single/multi argument case.
+
+// Parse Double benchmarks
+static void BM_ParseFastFloat(benchmark::State& state) {
+  std::vector<std::string> args(100);
+  std::random_device rd;
+
+  for (auto& arg : args) {
+    arg = std::to_string(std::uniform_real_distribution<double>(0, 1e5)(rd));
+  }
+  double res;
+  while (state.KeepRunning()) {
+    for (const auto& arg : args) {
+      fast_float::from_chars(arg.data(), arg.data() + arg.size(), res);
+    }
+  }
+}
+BENCHMARK(BM_ParseFastFloat);
+
+static void BM_ParseDoubleAbsl(benchmark::State& state) {
+  std::vector<std::string> args(100);
+  std::random_device rd;
+  for (auto& arg : args) {
+    arg = std::to_string(std::uniform_real_distribution<double>(0, 1e5)(rd));
+  }
+
+  double res;
+  while (state.KeepRunning()) {
+    for (const auto& arg : args) {
+      absl::from_chars(arg.data(), arg.data() + arg.size(), res);
+    }
+  }
+}
+BENCHMARK(BM_ParseDoubleAbsl);
 
 }  // namespace dfly

@@ -1,14 +1,17 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
 #pragma once
 
-#include <boost/fiber/mutex.hpp>
+#include <absl/container/fixed_array.h>
+#include <absl/types/span.h>
+
 #include <functional>
+#include <optional>
 #include <string_view>
 
-#include "core/core_types.h"
+#include "util/fibers/synchronization.h"
 
 typedef struct lua_State lua_State;
 
@@ -16,8 +19,7 @@ namespace dfly {
 
 class ObjectExplorer {
  public:
-  virtual ~ObjectExplorer() {
-  }
+  virtual ~ObjectExplorer() = default;
 
   virtual void OnBool(bool b) = 0;
   virtual void OnString(std::string_view str) = 0;
@@ -28,17 +30,49 @@ class ObjectExplorer {
   virtual void OnNil() = 0;
   virtual void OnStatus(std::string_view str) = 0;
   virtual void OnError(std::string_view str) = 0;
+
+  virtual void OnMapStart(unsigned len) {
+    OnArrayStart(len * 2);
+  }
+
+  virtual void OnMapEnd() {
+    OnArrayEnd();
+  }
 };
 
 class Interpreter {
  public:
-  using RedisFunc = std::function<void(MutSliceSpan, ObjectExplorer*)>;
+  using SliceSpan = absl::Span<const std::string_view>;
+
+  // Arguments received from redis.call
+  struct CallArgs {
+    // Full arguments, including cmd name.
+    SliceSpan args;
+
+    // Pointer to backing storage for args (excluding cmd name).
+    // Moving can invalidate arg slice pointers. Moved by async to re-use buffer.
+    std::string* buffer;
+
+    ObjectExplorer* translator;
+
+    bool async;        // async by acall
+    bool error_abort;  // abort on errors (not pcall)
+
+    // The function can request an abort due to an error, even if error_abort is false.
+    // It happens when async cmds are flushed and result in an uncatched error.
+    bool* requested_abort;
+  };
+
+  using RedisFunc = std::function<void(CallArgs)>;
 
   Interpreter();
   ~Interpreter();
 
   Interpreter(const Interpreter&) = delete;
   void operator=(const Interpreter&) = delete;
+
+  Interpreter(Interpreter&&) = default;
+  Interpreter& operator=(Interpreter&&) = default;
 
   // Note: We leak the state for now.
   // Production code should not access this method.
@@ -52,10 +86,8 @@ class Interpreter {
     COMPILE_ERR = 2,
   };
 
-  // returns false if an error happenned, sets error string into result.
-  // otherwise, returns true and sets result to function id.
-  // function id is sha1 of the function body.
-  AddResult AddFunction(std::string_view body, std::string* result);
+  // Add function with sha and body to interpreter.
+  AddResult AddFunction(std::string_view sha, std::string_view body, std::string* error);
 
   bool Exists(std::string_view sha) const;
 
@@ -65,7 +97,7 @@ class Interpreter {
     RUN_ERR = 2,
   };
 
-  void SetGlobalArray(const char* name, MutSliceSpan args);
+  void SetGlobalArray(const char* name, SliceSpan args);
 
   // Runs already added function sha returned by a successful call to AddFunction().
   // Returns: true if the call succeeded, otherwise fills error and returns false.
@@ -82,22 +114,20 @@ class Interpreter {
 
   void ResetStack();
 
+  void RunGC();
+
   // fp must point to buffer with at least 41 chars.
   // fp[40] will be set to '\0'.
   static void FuncSha1(std::string_view body, char* fp);
+
+  static std::optional<std::string> DetectPossibleAsyncCalls(std::string_view body);
 
   template <typename U> void SetRedisFunc(U&& u) {
     redis_func_ = std::forward<U>(u);
   }
 
-  // We have interpreter per thread, not per connection.
-  // Since we might preempt into different fibers when operating on interpreter
-  // we must lock it until we finish using it per request.
-  // Only RunFunction with companions require locking since other functions perform atomically
-  // without preemptions.
-  std::lock_guard<::boost::fibers::mutex> Lock() {
-    return std::lock_guard<::boost::fibers::mutex>{mu_};
-  }
+  // Invoke command with arguments from lua stack, given options and possibly custom explorer
+  int RedisGenericCommand(bool raise_error, bool async, ObjectExplorer* explorer = nullptr);
 
  private:
   // Returns true if function was successfully added,
@@ -105,19 +135,60 @@ class Interpreter {
   bool AddInternal(const char* f_id, std::string_view body, std::string* error);
   bool IsTableSafe() const;
 
-  int RedisGenericCommand(bool raise_error);
-
   static int RedisCallCommand(lua_State* lua);
   static int RedisPCallCommand(lua_State* lua);
+  static int RedisACallCommand(lua_State* lua);
+  static int RedisAPCallCommand(lua_State* lua);
+
+  std::optional<absl::FixedArray<std::string_view, 4>> PrepareArgs();
+  bool CallRedisFunction(bool raise_error, bool async, ObjectExplorer* explorer, SliceSpan args);
 
   lua_State* lua_;
   unsigned cmd_depth_ = 0;
   RedisFunc redis_func_;
+  std::string buffer_;
+  char name_buffer_[32];  // backing storage for cmd name
+};
 
-  // We have interpreter per thread, not per connection.
-  // Since we might preempt into different fibers when operating on interpreter
-  // we must lock it until we finish using it per request.
-  ::boost::fibers::mutex mu_;
+// Manages an internal interpreter pool. This allows multiple connections residing on the same
+// thread to run multiple lua scripts in parallel.
+class InterpreterManager {
+ public:
+  struct Stats {
+    Stats& operator+=(const Stats& other);
+
+    uint64_t used_bytes = 0;
+    uint64_t interpreter_cnt = 0;
+    uint64_t blocked_cnt = 0;
+  };
+
+ public:
+  InterpreterManager(unsigned num) : waker_{}, available_{}, storage_{} {
+    // We pre-allocate the backing storage during initialization and
+    // start storing pointers to slots in the available vector.
+    storage_.reserve(num);
+  }
+
+  // Borrow interpreter. Always return it after usage.
+  Interpreter* Get();
+  void Return(Interpreter*);
+
+  // Clear all interpreters, keeps capacity. Waits until all are returned.
+  void Reset();
+
+  // Run on all unused interpreters. Those are marked as used at once, so the callback can preempt
+  void Alter(std::function<void(Interpreter*)> modf);
+
+  static Stats& tl_stats();
+
+ private:
+  util::fb2::EventCount waker_, reset_ec_;
+  std::vector<Interpreter*> available_;
+  std::vector<Interpreter> storage_;
+
+  util::fb2::Mutex reset_mu_;  // Acts as a singleton.
+
+  unsigned return_untracked_ = 0;  // Number of returned interpreters during reset.
 };
 
 }  // namespace dfly

@@ -1,4 +1,4 @@
-// Copyright 2021, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -7,6 +7,7 @@
 #include "core/dash.h"
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/strings/str_cat.h>
 #include <mimalloc.h>
 
 #include <functional>
@@ -16,6 +17,8 @@
 #include "base/hash.h"
 #include "base/logging.h"
 #include "base/zipf_gen.h"
+#include "io/file.h"
+#include "io/line_reader.h"
 
 extern "C" {
 #include "redis/dict.h"
@@ -31,6 +34,10 @@ namespace dfly {
 
 static uint64_t callbackHash(const void* key) {
   return XXH64(&key, sizeof(key), 0);
+}
+
+template <typename K> auto EqTo(const K& key) {
+  return [&key](const auto& probe) { return key == probe; };
 }
 
 static dictType IntDict = {callbackHash, NULL, NULL, NULL, NULL, NULL, NULL};
@@ -76,12 +83,12 @@ struct UInt64Policy : public BasicDashPolicy {
 };
 
 struct RelaxedBumpPolicy {
-  bool CanBumpDown(uint64_t key) const {
+  bool CanBump(uint64_t key) const {
     return true;
   }
 };
 
-class CappedResource final : public std::pmr::memory_resource {
+class CappedResource final : public PMR_NS::memory_resource {
  public:
   explicit CappedResource(size_t cap) : cap_(cap) {
   }
@@ -95,7 +102,7 @@ class CappedResource final : public std::pmr::memory_resource {
     if (used_ + size > cap_)
       throw std::bad_alloc{};
 
-    void* res = pmr::get_default_resource()->allocate(size, align);
+    void* res = PMR_NS::get_default_resource()->allocate(size, align);
     used_ += size;
 
     return res;
@@ -103,10 +110,10 @@ class CappedResource final : public std::pmr::memory_resource {
 
   void do_deallocate(void* ptr, std::size_t size, std::size_t align) {
     used_ -= size;
-    pmr::get_default_resource()->deallocate(ptr, size, align);
+    PMR_NS::get_default_resource()->deallocate(ptr, size, align);
   }
 
-  bool do_is_equal(const std::pmr::memory_resource& o) const noexcept {
+  bool do_is_equal(const PMR_NS::memory_resource& o) const noexcept {
     return this == &o;
   }
 
@@ -133,8 +140,7 @@ class DashTest : public testing::Test {
   bool Find(Segment::Key_t key, Segment::Value_t* val) const {
     uint64_t hash = dt_.DoHash(key);
 
-    std::equal_to<Segment::Key_t> eq;
-    auto it = segment_.FindIt(key, hash, eq);
+    auto it = segment_.FindIt(hash, EqTo(key));
     if (!it.found())
       return false;
     *val = segment_.Value(it.index, it.slot);
@@ -143,9 +149,7 @@ class DashTest : public testing::Test {
 
   bool Contains(Segment::Key_t key) const {
     uint64_t hash = dt_.DoHash(key);
-
-    std::equal_to<Segment::Key_t> eq;
-    auto it = segment_.FindIt(key, hash, eq);
+    auto it = segment_.FindIt(hash, EqTo(key));
     return it.found();
   }
 
@@ -158,16 +162,15 @@ class DashTest : public testing::Test {
 set<Segment::Key_t> DashTest::FillSegment(unsigned bid) {
   std::set<Segment::Key_t> keys;
 
-  std::equal_to<Segment::Key_t> eq;
   for (Segment::Key_t key = 0; key < 1000000u; ++key) {
     uint64_t hash = dt_.DoHash(key);
-    unsigned bi = (hash >> 8) % Segment::kNumBuckets;
+    unsigned bi = (hash >> 8) % Segment::kBucketNum;
     if (bi != bid)
       continue;
     uint8_t fp = hash & 0xFF;
     if (fp > 2)  // limit fps considerably to find interesting cases.
       continue;
-    auto [it, success] = segment_.Insert(key, 0, hash, eq);
+    auto [it, success] = segment_.Insert(key, 0, hash, EqTo(key));
     if (!success) {
       LOG(INFO) << "Stopped at " << key;
       break;
@@ -200,10 +203,9 @@ TEST_F(DashTest, Basic) {
   Segment::Key_t key = 0;
   Segment::Value_t val = 0;
   uint64_t hash = dt_.DoHash(key);
-  std::equal_to<Segment::Key_t> eq;
 
-  EXPECT_TRUE(segment_.Insert(key, val, hash, eq).second);
-  auto [it, res] = segment_.Insert(key, val, hash, eq);
+  EXPECT_TRUE(segment_.Insert(key, val, hash, EqTo(key)).second);
+  auto [it, res] = segment_.Insert(key, val, hash, EqTo(key));
   EXPECT_TRUE(!res && it.found());
 
   EXPECT_TRUE(Find(key, &val));
@@ -217,7 +219,7 @@ TEST_F(DashTest, Basic) {
 
   auto hfun = &UInt64Policy::HashFn;
 
-  auto cursor = segment_.TraverseLogicalBucket((hash >> 8) % Segment::kNumBuckets, hfun, cb);
+  auto cursor = segment_.TraverseLogicalBucket((hash >> 8) % Segment::kBucketNum, hfun, cb);
   ASSERT_EQ(1, has_called);
   ASSERT_EQ(0, segment_.TraverseLogicalBucket(cursor, hfun, cb));
   ASSERT_EQ(1, has_called);
@@ -226,17 +228,20 @@ TEST_F(DashTest, Basic) {
 
 TEST_F(DashTest, Segment) {
   std::unique_ptr<Segment> seg(new Segment(1));
+
+#ifndef __APPLE__
   LOG(INFO) << "Segment size " << sizeof(Segment)
             << " malloc size: " << malloc_usable_size(seg.get());
+#endif
 
   set<Segment::Key_t> keys = FillSegment(0);
 
   EXPECT_TRUE(segment_.GetBucket(0).IsFull() && segment_.GetBucket(1).IsFull());
-  for (size_t i = 2; i < Segment::kNumBuckets; ++i) {
+  for (size_t i = 2; i < Segment::kBucketNum; ++i) {
     EXPECT_EQ(0, segment_.GetBucket(i).Size());
   }
-  EXPECT_EQ(4 * Segment::kNumSlots, keys.size());
-  EXPECT_EQ(4 * Segment::kNumSlots, segment_.SlowSize());
+  EXPECT_EQ(4 * Segment::kSlotNum, keys.size());
+  EXPECT_EQ(4 * Segment::kSlotNum, segment_.SlowSize());
 
   auto hfun = &UInt64Policy::HashFn;
   unsigned has_called = 0;
@@ -249,21 +254,21 @@ TEST_F(DashTest, Segment) {
   segment_.TraverseAll(cb);
   ASSERT_EQ(keys.size(), has_called);
 
-  ASSERT_TRUE(segment_.GetBucket(Segment::kNumBuckets).IsFull());
-  std::array<uint64_t, Segment::kNumSlots * 2> arr;
+  ASSERT_TRUE(segment_.GetBucket(Segment::kBucketNum).IsFull());
+  std::array<uint64_t, Segment::kSlotNum * 2> arr;
   uint64_t* next = arr.begin();
-  for (unsigned i = Segment::kNumBuckets; i < Segment::kNumBuckets + 2; ++i) {
+  for (unsigned i = Segment::kBucketNum; i < Segment::kBucketNum + 2; ++i) {
     const auto* k = &segment_.Key(i, 0);
-    next = std::copy(k, k + Segment::kNumSlots, next);
+    next = std::copy(k, k + Segment::kSlotNum, next);
   }
-  std::equal_to<Segment::Key_t> eq;
+
   for (auto k : arr) {
     auto hash = hfun(k);
-    auto it = segment_.FindIt(k, hash, eq);
+    auto it = segment_.FindIt(hash, [&k](const auto& probe) { return k == probe; });
     ASSERT_TRUE(it.found());
     segment_.Delete(it, hash);
   }
-  EXPECT_EQ(2 * Segment::kNumSlots, segment_.SlowSize());
+  EXPECT_EQ(2 * Segment::kSlotNum, segment_.SlowSize());
   ASSERT_FALSE(Contains(arr.front()));
 }
 
@@ -306,16 +311,17 @@ TEST_F(DashTest, SegmentFull) {
 }
 
 TEST_F(DashTest, Split) {
+  // fills segment with maximum keys that must reside in bucket id 0.
   set<Segment::Key_t> keys = FillSegment(0);
   Segment::Value_t val;
-  Segment s2{2};
+  Segment s2{2};  // segment with local depth 2.
 
   segment_.Split(&UInt64Policy::HashFn, &s2);
   unsigned sum[2] = {0};
-  std::equal_to<Segment::Key_t> eq;
   for (auto key : keys) {
-    auto it1 = segment_.FindIt(key, dt_.DoHash(key), eq);
-    auto it2 = s2.FindIt(key, dt_.DoHash(key), eq);
+    auto eq = [key](const auto& probe) { return key == probe; };
+    auto it1 = segment_.FindIt(dt_.DoHash(key), eq);
+    auto it2 = s2.FindIt(dt_.DoHash(key), eq);
     ASSERT_NE(it1.found(), it2.found()) << key;
 
     sum[0] += it1.found();
@@ -325,14 +331,24 @@ TEST_F(DashTest, Split) {
   ASSERT_EQ(segment_.SlowSize(), sum[0]);
   EXPECT_EQ(s2.SlowSize(), sum[1]);
   EXPECT_EQ(keys.size(), sum[0] + sum[1]);
-  EXPECT_EQ(4 * Segment::kNumSlots, keys.size());
+  EXPECT_EQ(4 * Segment::kSlotNum, keys.size());
+}
+
+TEST_F(DashTest, Merge) {
+  set<Segment::Key_t> keys = FillSegment(0);
+  Segment s2{2};  // segment with local depth 2.
+
+  segment_.Split(&UInt64Policy::HashFn, &s2);
+  ASSERT_EQ(segment_.SlowSize() + s2.SlowSize(), keys.size());
+  segment_.MoveFrom(&UInt64Policy::HashFn, &s2);
+  EXPECT_EQ(segment_.SlowSize(), keys.size());
 }
 
 TEST_F(DashTest, BumpUp) {
   set<Segment::Key_t> keys = FillSegment(0);
-  constexpr unsigned kFirstStashId = Segment::kNumBuckets;
-  constexpr unsigned kSecondStashId = Segment::kNumBuckets + 1;
-  constexpr unsigned kNumSlots = Segment::kNumSlots;
+  constexpr unsigned kFirstStashId = Segment::kBucketNum;
+  constexpr unsigned kSecondStashId = Segment::kBucketNum + 1;
+  constexpr unsigned kSlotNum = Segment::kSlotNum;
 
   EXPECT_TRUE(segment_.GetBucket(0).IsFull());
   EXPECT_TRUE(segment_.GetBucket(1).IsFull());
@@ -352,8 +368,9 @@ TEST_F(DashTest, BumpUp) {
   key = segment_.Key(kFirstStashId, 5);
   hash = dt_.DoHash(key);
 
-  EXPECT_EQ(1, segment_.CVCOnBump(1, kFirstStashId, 5, hash, touched_bid));
-  EXPECT_EQ(touched_bid[0], 1);
+  EXPECT_EQ(2, segment_.CVCOnBump(1, kFirstStashId, 5, hash, touched_bid));
+  EXPECT_EQ(touched_bid[0], 0);
+  EXPECT_EQ(touched_bid[1], 1);
 
   // Bump up
   segment_.BumpUp(kFirstStashId, 5, hash, RelaxedBumpPolicy{});
@@ -368,11 +385,16 @@ TEST_F(DashTest, BumpUp) {
   key = segment_.Key(kSecondStashId, 9);
   hash = dt_.DoHash(key);
 
-  EXPECT_EQ(1, segment_.CVCOnBump(2, kSecondStashId, 9, hash, touched_bid));
+  EXPECT_EQ(3, segment_.CVCOnBump(2, kSecondStashId, 9, hash, touched_bid));
   EXPECT_EQ(touched_bid[0], kSecondStashId);
+  // Bumpup will move the key to either its original bucket or a probing bucket.
+  // Since we can't determine the exact bucket before calling bumpup, CVCOnBump
+  // returns both the original bucket and the probing bucket.
+  EXPECT_EQ(touched_bid[1], 0);
+  EXPECT_EQ(touched_bid[2], 1);
 
   segment_.BumpUp(kSecondStashId, 9, hash, RelaxedBumpPolicy{});
-  ASSERT_TRUE(key == segment_.Key(0, kNumSlots - 1) || key == segment_.Key(1, kNumSlots - 1));
+  ASSERT_TRUE(key == segment_.Key(0, kSlotNum - 1) || key == segment_.Key(1, kSlotNum - 1));
   EXPECT_TRUE(segment_.GetBucket(kSecondStashId).IsFull());
   EXPECT_TRUE(Contains(key));
   EXPECT_TRUE(segment_.Key(kSecondStashId, 9));
@@ -380,13 +402,13 @@ TEST_F(DashTest, BumpUp) {
 
 TEST_F(DashTest, BumpPolicy) {
   struct RestrictedBumpPolicy {
-    bool CanBumpDown(uint64_t key) const {
+    bool CanBump(uint64_t key) const {
       return false;
     }
   };
 
   set<Segment::Key_t> keys = FillSegment(0);
-  constexpr unsigned kFirstStashId = Segment::kNumBuckets;
+  constexpr unsigned kFirstStashId = Segment::kBucketNum;
 
   EXPECT_TRUE(segment_.GetBucket(0).IsFull());
   EXPECT_TRUE(segment_.GetBucket(1).IsFull());
@@ -453,14 +475,29 @@ TEST_F(DashTest, Custom) {
   (void)kBuckSz;
 
   ItemSegment seg{2};
-  auto cb = [](auto v, auto u) { return v.buf[0] == u.buf[0] && v.buf[1] == u.buf[1]; };
 
-  auto it = seg.FindIt(Item{1, 1}, 42, cb);
+  auto eq = [v = Item{1, 1}](auto u) { return v.buf[0] == u.buf[0] && v.buf[1] == u.buf[1]; };
+  auto it = seg.FindIt(42, eq);
   ASSERT_FALSE(it.found());
 }
 
+TEST_F(DashTest, FindByValue) {
+  using ItemSegment = detail::Segment<Item, uint64_t>;
+
+  // Insert three different values with the same hash
+  ItemSegment segment{2};
+  segment.Insert(Item{1}, 1, 42, [](const auto& pred) { return pred.buf[0] == 1; });
+  segment.Insert(Item{2}, 2, 42, [](const auto& pred) { return pred.buf[0] == 2; });
+  segment.Insert(Item{3}, 3, 42, [](const auto& pred) { return pred.buf[0] == 3; });
+
+  // We should be able to find the middle one by value
+  auto it = segment.FindIt(42, [](const auto& key, const auto& value) { return value == 2; });
+  EXPECT_TRUE(it.found());
+  EXPECT_EQ(segment.Value(it.index, it.slot), 2);
+}
+
 TEST_F(DashTest, Reserve) {
-  unsigned bc = dt_.bucket_count();
+  unsigned bc = dt_.capacity();
   for (unsigned i = 0; i <= bc * 2; ++i) {
     dt_.Reserve(i);
     ASSERT_GE((1 << dt_.depth()) * Dash64::kSegCapacity, i);
@@ -512,7 +549,7 @@ TEST_F(DashTest, Traverse) {
     dt_.Insert(i, i);
   }
 
-  Dash64::cursor cursor;
+  Dash64::Cursor cursor;
   vector<unsigned> nums;
   auto tr_cb = [&](Dash64::iterator it) {
     nums.push_back(it->first);
@@ -529,24 +566,63 @@ TEST_F(DashTest, Traverse) {
   EXPECT_EQ(kNumItems - 1, nums.back());
 }
 
-TEST_F(DashTest, Bucket) {
-  constexpr auto kNumItems = 250;
+TEST_F(DashTest, TraverseSegmentOrder) {
+  constexpr auto kNumItems = 50;
   for (size_t i = 0; i < kNumItems; ++i) {
-    dt_.Insert(i, 0);
+    dt_.Insert(i, i);
   }
-  std::vector<uint64_t> s;
-  auto it = dt_.begin();
-  auto bucket_it = Dash64::bucket_it(it);
 
-  dt_.TraverseBucket(it, [&](auto i) { s.push_back(i->first); });
+  vector<unsigned> nums;
+  auto tr_cb = [&](Dash64::iterator it) {
+    nums.push_back(it->first);
+    VLOG(1) << it.bucket_id() << " " << it.slot_id() << " " << it->first;
+  };
 
-  unsigned num_items = 0;
-  while (!bucket_it.is_done()) {
-    ASSERT_TRUE(find(s.begin(), s.end(), bucket_it->first) != s.end());
-    ++bucket_it;
-    ++num_items;
+  Dash64::Cursor cursor;
+  do {
+    cursor = dt_.TraverseBySegmentOrder(cursor, tr_cb);
+  } while (cursor);
+
+  sort(nums.begin(), nums.end());
+  nums.resize(unique(nums.begin(), nums.end()) - nums.begin());
+  ASSERT_EQ(kNumItems, nums.size());
+  EXPECT_EQ(0, nums[0]);
+  EXPECT_EQ(kNumItems - 1, nums.back());
+}
+
+TEST_F(DashTest, TraverseBucketOrder) {
+  constexpr auto kNumItems = 18000;
+  for (size_t i = 0; i < kNumItems; ++i) {
+    dt_.Insert(i, i);
   }
-  EXPECT_EQ(s.size(), num_items);
+  for (size_t i = 0; i < kNumItems; ++i) {
+    dt_.Erase(i);
+  }
+  constexpr auto kSparseItems = kNumItems / 50;
+  for (size_t i = 0; i < kSparseItems; ++i) {  // create sparse table
+    dt_.Insert(i, i);
+  }
+
+  vector<unsigned> nums;
+  auto tr_cb = [&](Dash64::bucket_iterator it) {
+    VLOG(1) << "call cb";
+    while (!it.is_done()) {
+      nums.push_back(it->first);
+      VLOG(1) << it.bucket_id() << " " << it.slot_id() << " " << it->first;
+      ++it;
+    }
+  };
+
+  Dash64::Cursor cursor;
+  do {
+    cursor = dt_.TraverseBuckets(cursor, tr_cb);
+  } while (cursor);
+
+  sort(nums.begin(), nums.end());
+  nums.resize(unique(nums.begin(), nums.end()) - nums.begin());
+  ASSERT_EQ(kSparseItems, nums.size());
+  EXPECT_EQ(0, nums[0]);
+  EXPECT_EQ(kSparseItems - 1, nums.back());
 }
 
 struct TestEvictionPolicy {
@@ -557,7 +633,7 @@ struct TestEvictionPolicy {
   }
 
   bool CanGrow(const Dash64& tbl) const {
-    return tbl.bucket_count() < max_capacity;
+    return tbl.capacity() < max_capacity;
   }
 
   void RecordSplit(Dash64::Segment_t*) {
@@ -605,7 +681,7 @@ TEST_F(DashTest, Eviction) {
     last_slot = bit.slot_id();
     ++bit;
   }
-  ASSERT_LT(last_slot, Dash64::kBucketWidth);
+  ASSERT_LT(last_slot, Dash64::kSlotNum);
 
   bit = dt_.begin();
   dt_.ShiftRight(bit);
@@ -627,7 +703,7 @@ TEST_F(DashTest, Eviction) {
 
   // Now the bucket is full.
   keys.clear();
-  uint64_t last_key = dt_.GetSegment(0)->Key(0, Dash64::kBucketWidth - 1);
+  uint64_t last_key = dt_.GetSegment(0)->Key(0, Dash64::kSlotNum - 1);
   for (Dash64::bucket_iterator bit = dt_.begin(); !bit.is_done(); ++bit) {
     keys.insert(bit->first);
   }
@@ -796,6 +872,31 @@ TEST_F(DashTest, Sds) {
   // dt.Insert(std::string_view{"bar"}, 1);
 }
 
+struct BlankPolicy : public BasicDashPolicy {
+  static uint64_t HashFn(uint64_t v) {
+    return v;
+  }
+};
+
+// The bug was that for very rare cases when during segment splitting we move all the items
+// into a new segment, not every item finds a place.
+TEST_F(DashTest, SplitBug) {
+  DashTable<uint64_t, uint64_t, BlankPolicy> table;
+
+  io::ReadonlyFileOrError fl_err =
+      io::OpenRead(base::ProgramRunfile("testdata/ids.txt"), io::ReadonlyFile::Options{});
+  CHECK(fl_err);
+  io::FileSource fs(std::move(*fl_err));
+  io::LineReader lr(&fs, DO_NOT_TAKE_OWNERSHIP);
+  string_view line;
+  uint64_t val;
+  while (lr.Next(&line)) {
+    CHECK(absl::SimpleHexAtoi(line, &val)) << line;
+    table.Insert(val, 0);
+  }
+  EXPECT_EQ(746, table.size());
+}
+
 /**
  ______     _      _   _               _______        _
 |  ____|   (_)    | | (_)             |__   __|      | |
@@ -846,7 +947,7 @@ struct SimpleEvictPolicy {
   static constexpr bool can_evict = true;
 
   bool CanGrow(const U64Dash& tbl) {
-    return tbl.bucket_count() + U64Dash::kSegCapacity < max_capacity;
+    return tbl.capacity() + U64Dash::kSegCapacity < max_capacity;
   }
 
   void RecordSplit(U64Dash::Segment_t* segment) {
@@ -856,14 +957,14 @@ struct SimpleEvictPolicy {
   // returns number of items evicted from the table.
   // 0 means - nothing has been evicted.
   unsigned Evict(const U64Dash::HotspotBuckets& hotb, U64Dash* me) {
-    constexpr unsigned kNumBuckets = U64Dash::HotspotBuckets::kNumBuckets;
+    constexpr unsigned kBucketNum = U64Dash::HotspotBuckets::kNumBuckets;
 
-    uint32_t bid = hotb.key_hash % kNumBuckets;
+    uint32_t bid = hotb.key_hash % kBucketNum;
 
-    unsigned slot_index = (hotb.key_hash >> 32) % U64Dash::kBucketWidth;
+    unsigned slot_index = (hotb.key_hash >> 32) % U64Dash::kSlotNum;
 
-    for (unsigned i = 0; i < kNumBuckets; ++i) {
-      auto it = hotb.at((bid + i) % kNumBuckets);
+    for (unsigned i = 0; i < kBucketNum; ++i) {
+      auto it = hotb.at((bid + i) % kBucketNum);
       it += slot_index;
 
       if (it.is_done())
@@ -891,7 +992,7 @@ struct ShiftRightPolicy {
   static constexpr bool can_evict = true;
 
   bool CanGrow(const U64Dash& tbl) {
-    return tbl.bucket_count() + U64Dash::kSegCapacity < max_capacity;
+    return tbl.capacity() + U64Dash::kSegCapacity < max_capacity;
   }
 
   void RecordSplit(U64Dash::Segment_t* segment) {
@@ -902,7 +1003,7 @@ struct ShiftRightPolicy {
 
     unsigned stash_pos = hotb.key_hash % kNumStashBuckets;
     auto stash_it = hotb.probes.by_type.stash_buckets[stash_pos];
-    stash_it += (U64Dash::kBucketWidth - 1);  // go to the last slot.
+    stash_it += (U64Dash::kSlotNum - 1);  // go to the last slot.
 
     uint64_t k = stash_it->first;
     DVLOG(1) << "Deleting key " << k << " from " << stash_it.bucket_id() << "/"

@@ -1,11 +1,12 @@
-// Copyright 2021, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 #pragma once
 
-#include <memory_resource>
 #include <vector>
 
+#include "absl/random/random.h"
+#include "base/pmr/memory_resource.h"
 #include "core/dash_internal.h"
 
 namespace dfly {
@@ -33,15 +34,8 @@ class DashTable : public detail::DashTableBase {
   DashTable(const DashTable&) = delete;
   DashTable& operator=(const DashTable&) = delete;
 
-  struct SegmentPolicy {
-    static constexpr unsigned NUM_SLOTS = Policy::kSlotNum;
-    static constexpr unsigned BUCKET_CNT = Policy::kBucketNum;
-    static constexpr unsigned STASH_BUCKET_NUM = Policy::kStashBucketNum;
-    static constexpr bool USE_VERSION = Policy::kUseVersion;
-  };
-
   using Base = detail::DashTableBase;
-  using SegmentType = detail::Segment<_Key, _Value, SegmentPolicy>;
+  using SegmentType = detail::Segment<_Key, _Value, Policy>;
   using SegmentIterator = typename SegmentType::Iterator;
 
  public:
@@ -49,17 +43,12 @@ class DashTable : public detail::DashTableBase {
   using Value_t = _Value;
   using Segment_t = SegmentType;
 
-  //! Number of "official" buckets that are used to position a key. In other words, does not include
-  //! stash buckets.
-  static constexpr unsigned kLogicalBucketNum = Policy::kBucketNum;
-
   //! Total number of buckets in a segment (including stash).
-  static constexpr unsigned kPhysicalBucketNum = SegmentType::kTotalBuckets;
-  static constexpr unsigned kBucketWidth = Policy::kSlotNum;
   static constexpr double kTaxAmount = SegmentType::kTaxSize;
   static constexpr size_t kSegBytes = sizeof(SegmentType);
   static constexpr size_t kSegCapacity = SegmentType::capacity();
-  static constexpr bool kUseVersion = Policy::kUseVersion;
+  static constexpr size_t kSlotNum = SegmentType::kSlotNum;
+  static constexpr size_t kBucketNum = SegmentType::kBucketNum;
 
   // if IsSingleBucket is true - iterates only over a single bucket.
   template <bool IsConst, bool IsSingleBucket = false> class Iterator;
@@ -69,7 +58,7 @@ class DashTable : public detail::DashTableBase {
 
   using const_bucket_iterator = Iterator<true, true>;
   using bucket_iterator = Iterator<false, true>;
-  using cursor = detail::DashCursor;
+  using Cursor = detail::DashCursor;
 
   struct HotspotBuckets {
     static constexpr size_t kRegularBuckets = 4;
@@ -127,7 +116,7 @@ class DashTable : public detail::DashTableBase {
   };
 
   DashTable(size_t capacity_log = 1, const Policy& policy = Policy{},
-            std::pmr::memory_resource* mr = std::pmr::get_default_resource());
+            PMR_NS::memory_resource* mr = PMR_NS::get_default_resource());
   ~DashTable();
 
   void Reserve(size_t size);
@@ -135,16 +124,37 @@ class DashTable : public detail::DashTableBase {
   // false for duplicate, true if inserted.
   template <typename U, typename V> std::pair<iterator, bool> Insert(U&& key, V&& value) {
     DefaultEvictionPolicy policy;
-    return InsertInternal(std::forward<U>(key), std::forward<V>(value), policy);
+    return InsertInternal(std::forward<U>(key), std::forward<V>(value), policy,
+                          InsertMode::kInsertIfNotFound);
   }
 
   template <typename U, typename V, typename EvictionPolicy>
   std::pair<iterator, bool> Insert(U&& key, V&& value, EvictionPolicy& ev) {
-    return InsertInternal(std::forward<U>(key), std::forward<V>(value), ev);
+    return InsertInternal(std::forward<U>(key), std::forward<V>(value), ev,
+                          InsertMode::kInsertIfNotFound);
+  }
+
+  template <typename U, typename V> iterator InsertNew(U&& key, V&& value) {
+    DefaultEvictionPolicy policy;
+    return InsertNew(std::forward<U>(key), std::forward<V>(value), policy);
+  }
+
+  template <typename U, typename V, typename EvictionPolicy>
+  iterator InsertNew(U&& key, V&& value, EvictionPolicy& ev) {
+    return InsertInternal(std::forward<U>(key), std::forward<V>(value), ev,
+                          InsertMode::kForceInsert)
+        .first;
   }
 
   template <typename U> const_iterator Find(U&& key) const;
   template <typename U> iterator Find(U&& key);
+
+  // Prefetches the memory where the key would resize into the cache.
+  template <typename U> void Prefetch(U&& key) const;
+
+  // Find first entry with given key hash that evaulates to true on pred.
+  // Pred accepts either (const key&) or (const key&, const value&)
+  template <typename Pred> iterator FindFirst(uint64_t key_hash, Pred&& pred);
 
   // it must be valid.
   void Erase(iterator it);
@@ -179,6 +189,15 @@ class DashTable : public detail::DashTableBase {
     return segment_[segment_id];
   }
 
+  size_t GetSegmentCount() const {
+    return segment_.size();
+  }
+
+  size_t NextSeg(size_t sid) const {
+    size_t delta = (1u << (global_depth_ - segment_[sid]->local_depth()));
+    return sid + delta;
+  }
+
   template <typename U> uint64_t DoHash(const U& k) const {
     return policy_.HashFn(k);
   }
@@ -190,6 +209,11 @@ class DashTable : public detail::DashTableBase {
   }
 
   size_t bucket_count() const {
+    return unique_segments_ * SegmentType::kTotalBuckets;
+  }
+
+  // Overall capacity of the table (including stash buckets).
+  size_t capacity() const {
     return unique_segments_ * SegmentType::capacity();
   }
 
@@ -197,26 +221,55 @@ class DashTable : public detail::DashTableBase {
     return double(size()) / (SegmentType::capacity() * unique_segments());
   }
 
-  // Traverses over a single bucket in table and calls cb(iterator) 0 or more
+  // Gets a random cursor based on the available segments and buckets.
+  // Returns: cursor with a random position
+  Cursor GetRandomCursor(absl::BitGen* bitgen);
+
+  // Traverses over a single logical bucket in table and calls cb(iterator) 0 or more
   // times. if cursor=0 starts traversing from the beginning, otherwise continues from where it
   // stopped. returns 0 if the supplied cursor reached end of traversal. Traverse iterates at bucket
-  // granularity, which means for each non-empty bucket it calls cb per each entry in the bucket
-  // before returning. Unlike begin/end interface, traverse is stable during table mutations.
-  // It guarantees that if key exists (1)at the beginning of traversal, (2) stays in the table
-  // during the traversal, then Traverse() will eventually reach it even when the
-  // table shrinks or grows.
-  // Returns: cursor that is guaranteed to be less than 2^40.
-  template <typename Cb> cursor Traverse(cursor curs, Cb&& cb);
+  // logical granularity, which means for each non-empty bucket it calls cb per each entry in the
+  // logical bucket before returning. Unlike begin/end interface, traverse is stable during table
+  // mutations. It guarantees that if key exists (1)at the beginning of traversal, (2) stays in the
+  // table during the traversal, then Traverse() will eventually reach it even when the table
+  // shrinks or grows. Returns: cursor that is guaranteed to be less than 2^40.
+  template <typename Cb> Cursor Traverse(Cursor curs, Cb&& cb);
 
-  // Takes an iterator pointing to an entry in a dash bucket and traverses all bucket's entries by
-  // calling cb(iterator) for every non-empty slot. The iteration goes over a physical bucket.
-  template <typename Cb> void TraverseBucket(const_iterator it, Cb&& cb);
+  // Traverses over physical buckets. It calls cb once for each bucket by passing a bucket iterator.
+  // if cursor=0 starts traversing from the beginning, otherwise continues from where
+  // it stopped. returns 0 if the supplied cursor reached end of traversal.
+  // Unlike Traverse, TraverseBuckets calls cb once on bucket iterator and not on each entry in
+  // bucket. TraverseBuckets is stable during table mutations. It guarantees traversing all buckets
+  // that existed at the beginning of traversal.
+  template <typename Cb> Cursor TraverseBuckets(Cursor curs, Cb&& cb);
 
-  static const_bucket_iterator bucket_it(const_iterator it) {
+  Cursor AdvanceCursorBucketOrder(Cursor cursor);
+
+  // Traverses over a single bucket in table and calls cb(iterator). The traverse order will be
+  // segment by segment over physical backets.
+  // traverse by segment order does not guarantees coverage if the table grows/shrinks, it is useful
+  // when formal full coverage is not critically important.
+  template <typename Cb> Cursor TraverseBySegmentOrder(Cursor curs, Cb&& cb);
+
+  // Discards slots information.
+  static const_bucket_iterator BucketIt(const_iterator it) {
     return const_bucket_iterator{it.owner_, it.seg_id_, it.bucket_id_, 0};
   }
 
-  const_bucket_iterator CursorToBucketIt(cursor c) const {
+  // Seeks to the first occupied slot if exists in the bucket.
+  const_bucket_iterator BucketIt(unsigned segment_id, unsigned bucket_id) const {
+    return const_bucket_iterator{this, segment_id, uint8_t(bucket_id)};
+  }
+
+  bucket_iterator BucketIt(unsigned segment_id, unsigned bucket_id) {
+    return bucket_iterator{this, segment_id, uint8_t(bucket_id)};
+  }
+
+  iterator GetIterator(unsigned segment_id, unsigned bucket_id, unsigned slot_id) {
+    return iterator{this, segment_id, uint8_t(bucket_id), uint8_t(slot_id)};
+  }
+
+  const_bucket_iterator CursorToBucketIt(Cursor c) const {
     return const_bucket_iterator{this, c.segment_id(global_depth_), c.bucket_id(), 0};
   }
 
@@ -240,8 +293,7 @@ class DashTable : public detail::DashTableBase {
   // Returns true if an element was deleted i.e the rightmost slot was busy.
   bool ShiftRight(bucket_iterator it);
 
-  template<typename BumpPolicy>
-  iterator BumpUp(iterator it, const BumpPolicy& bp) {
+  template <typename BumpPolicy> iterator BumpUp(iterator it, const BumpPolicy& bp) {
     SegmentIterator seg_it =
         segment_[it.seg_id_]->BumpUp(it.bucket_id_, it.slot_id_, DoHash(it->first), bp);
 
@@ -257,8 +309,13 @@ class DashTable : public detail::DashTableBase {
   }
 
  private:
+  enum class InsertMode {
+    kInsertIfNotFound,
+    kForceInsert,
+  };
   template <typename U, typename V, typename EvictionPolicy>
-  std::pair<iterator, bool> InsertInternal(U&& key, V&& value, EvictionPolicy& policy);
+  std::pair<iterator, bool> InsertInternal(U&& key, V&& value, EvictionPolicy& policy,
+                                           InsertMode mode);
 
   void IncreaseDepth(unsigned new_depth);
   void Split(uint32_t seg_id);
@@ -267,17 +324,12 @@ class DashTable : public detail::DashTableBase {
   // the same object. IterateDistinct goes over all distinct segments in the table.
   template <typename Cb> void IterateDistinct(Cb&& cb);
 
-  size_t NextSeg(size_t sid) const {
-    size_t delta = (1u << (global_depth_ - segment_[sid]->local_depth()));
-    return sid + delta;
-  }
-
-  auto EqPred() const {
-    return [p = &policy_](const auto& a, const auto& b) -> bool { return p->Equal(a, b); };
+  template <typename K> auto EqPred(const K& key) const {
+    return [p = &policy_, &key](const auto& probe) -> bool { return p->Equal(probe, key); };
   }
 
   Policy policy_;
-  std::pmr::vector<SegmentType*> segment_;
+  std::vector<SegmentType*, PMR_NS::polymorphic_allocator<SegmentType*>> segment_;
 
   uint64_t garbage_collected_ = 0;
   uint64_t stash_unloaded_ = 0;
@@ -307,19 +359,26 @@ class DashTable<_Key, _Value, Policy>::Iterator {
  public:
   using iterator_category = std::forward_iterator_tag;
   using difference_type = std::ptrdiff_t;
+  using IteratorPairType =
+      std::conditional_t<IsConst, detail::IteratorPair<const Key_t, const Value_t>,
+                         detail::IteratorPair<Key_t, Value_t>>;
 
   // Copy constructor from iterator to const_iterator.
   template <bool TIsConst = IsConst, bool TIsSingleB,
             typename std::enable_if<TIsConst>::type* = nullptr>
   Iterator(const Iterator<!TIsConst, TIsSingleB>& other) noexcept
-      : owner_(other.owner_), seg_id_(other.seg_id_), bucket_id_(other.bucket_id_),
+      : owner_(other.owner_),
+        seg_id_(other.seg_id_),
+        bucket_id_(other.bucket_id_),
         slot_id_(other.slot_id_) {
   }
 
   // Copy constructor from iterator to bucket_iterator and vice versa.
   template <bool TIsSingle>
   Iterator(const Iterator<IsConst, TIsSingle>& other) noexcept
-      : owner_(other.owner_), seg_id_(other.seg_id_), bucket_id_(other.bucket_id_),
+      : owner_(other.owner_),
+        seg_id_(other.seg_id_),
+        bucket_id_(other.bucket_id_),
         slot_id_(IsSingleBucket ? 0 : other.slot_id_) {
     // if this - is a bucket_iterator - we reset slot_id to the first occupied space.
     if constexpr (IsSingleBucket) {
@@ -350,21 +409,30 @@ class DashTable<_Key, _Value, Policy>::Iterator {
     return *this;
   }
 
-  detail::IteratorPair<Key_t, Value_t> operator->() {
-    auto* seg = owner_->segment_[seg_id_];
-    return detail::IteratorPair<Key_t, Value_t>{seg->Key(bucket_id_, slot_id_),
-                                                seg->Value(bucket_id_, slot_id_)};
+  Iterator& AdvanceIfNotOccupied() {
+    if (!IsOccupied()) {
+      this->operator++();
+    }
+    return *this;
   }
 
-  const detail::IteratorPair<Key_t, Value_t> operator->() const {
+  IteratorPairType operator->() const {
     auto* seg = owner_->segment_[seg_id_];
-    return detail::IteratorPair<Key_t, Value_t>{seg->Key(bucket_id_, slot_id_),
-                                                seg->Value(bucket_id_, slot_id_)};
+    return {seg->Key(bucket_id_, slot_id_), seg->Value(bucket_id_, slot_id_)};
   }
 
   // Make it self-contained. Does not need container::end().
   bool is_done() const {
     return owner_ == nullptr;
+  }
+
+  bool IsOccupied() const {
+    return (seg_id_ < owner_->segment_.size()) &&
+           ((owner_->segment_[seg_id_]->IsBusy(bucket_id_, slot_id_)));
+  }
+
+  Owner& owner() const {
+    return *owner_;
   }
 
   template <bool B = Policy::kUseVersion> std::enable_if_t<B, uint64_t> GetVersion() const {
@@ -460,10 +528,10 @@ void DashTable<_Key, _Value, Policy>::Iterator<IsConst, IsSingleBucket>::Seek2Oc
 
 template <typename _Key, typename _Value, typename Policy>
 DashTable<_Key, _Value, Policy>::DashTable(size_t capacity_log, const Policy& policy,
-                                           std::pmr::memory_resource* mr)
+                                           PMR_NS::memory_resource* mr)
     : Base(capacity_log), policy_(policy), segment_(mr) {
   segment_.resize(unique_segments_);
-  std::pmr::polymorphic_allocator<SegmentType> pa(mr);
+  PMR_NS::polymorphic_allocator<SegmentType> pa(mr);
 
   // I assume we have enough memory to create the initial table and do not check allocations.
   for (auto& ptr : segment_) {
@@ -476,7 +544,7 @@ template <typename _Key, typename _Value, typename Policy>
 DashTable<_Key, _Value, Policy>::~DashTable() {
   Clear();
   auto* resource = segment_.get_allocator().resource();
-  std::pmr::polymorphic_allocator<SegmentType> pa(resource);
+  PMR_NS::polymorphic_allocator<SegmentType> pa(resource);
   using alloc_traits = std::allocator_traits<decltype(pa)>;
 
   IterateDistinct([&](SegmentType* seg) {
@@ -503,11 +571,11 @@ void DashTable<_Key, _Value, Policy>::CVCUponInsert(uint64_t ver_threshold, cons
     return;
   }
 
-  static_assert(kPhysicalBucketNum < 0xFF, "");
+  static_assert(SegmentType::kTotalBuckets < 0xFF, "");
 
   // Segment is full, we need to return the whole segment, because it can be split
   // and its entries can be reshuffled into different buckets.
-  for (uint8_t i = 0; i < kPhysicalBucketNum; ++i) {
+  for (uint8_t i = 0; i < SegmentType::kTotalBuckets; ++i) {
     if (target->GetVersion(i) < ver_threshold && !target->GetBucket(i).IsEmpty()) {
       cb(bucket_iterator{this, seg_id, i});
     }
@@ -560,7 +628,7 @@ void DashTable<_Key, _Value, Policy>::Clear() {
      and then erase all other distinct segments.
   **********/
   if (global_depth_ > initial_depth_) {
-    std::pmr::polymorphic_allocator<SegmentType> pa(segment_.get_allocator());
+    PMR_NS::polymorphic_allocator<SegmentType> pa(segment_.get_allocator());
     using alloc_traits = std::allocator_traits<decltype(pa)>;
 
     size_t dest = 0, src = 0;
@@ -593,8 +661,8 @@ bool DashTable<_Key, _Value, Policy>::ShiftRight(bucket_iterator it) {
   typename Segment_t::Hash_t hash_val = 0;
   auto& bucket = seg->GetBucket(it.bucket_id_);
 
-  if (bucket.GetBusy() & (1 << (kBucketWidth - 1))) {
-    it.slot_id_ = kBucketWidth - 1;
+  if (bucket.GetBusy() & (1 << (kSlotNum - 1))) {
+    it.slot_id_ = kSlotNum - 1;
     hash_val = DoHash(it->first);
     policy_.DestroyKey(it->first);
     policy_.DestroyValue(it->second);
@@ -623,33 +691,40 @@ template <typename _Key, typename _Value, typename Policy>
 template <typename U>
 auto DashTable<_Key, _Value, Policy>::Find(U&& key) const -> const_iterator {
   uint64_t key_hash = DoHash(key);
-  size_t seg_id = SegmentId(key_hash);  // seg_id takes up global_depth_ high bits.
-  const auto* target = segment_[seg_id];
+  uint32_t seg_id = SegmentId(key_hash);  // seg_id takes up global_depth_ high bits.
 
   // Hash structure is like this: [SSUUUUBF], where S is segment id, U - unused,
   // B - bucket id and F is a fingerprint. Segment id is needed to identify the correct segment.
   // Once identified, the segment instance uses the lower part of hash to locate the key.
   // It uses 8 least significant bits for a fingerprint and few more bits for bucket id.
-  auto seg_it = target->FindIt(key, key_hash, EqPred());
-
-  if (seg_it.found()) {
-    return const_iterator{this, seg_id, seg_it.index, seg_it.slot};
+  if (auto seg_it = segment_[seg_id]->FindIt(key_hash, EqPred(key)); seg_it.found()) {
+    return {this, seg_id, seg_it.index, seg_it.slot};
   }
-  return const_iterator{};
+  return {};
 }
 
 template <typename _Key, typename _Value, typename Policy>
 template <typename U>
 auto DashTable<_Key, _Value, Policy>::Find(U&& key) -> iterator {
-  uint64_t key_hash = DoHash(key);
-  size_t x = SegmentId(key_hash);
-  const auto* target = segment_[x];
+  return FindFirst(DoHash(key), EqPred(key));
+}
 
-  auto seg_it = target->FindIt(key, key_hash, EqPred());
-  if (seg_it.found()) {
-    return iterator{this, uint32_t(x), seg_it.index, seg_it.slot};
+template <typename _Key, typename _Value, typename Policy>
+template <typename U>
+void DashTable<_Key, _Value, Policy>::Prefetch(U&& key) const {
+  uint64_t key_hash = DoHash(key);
+  uint32_t seg_id = SegmentId(key_hash);
+  segment_[seg_id]->Prefetch(key_hash);
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename Pred>
+auto DashTable<_Key, _Value, Policy>::FindFirst(uint64_t key_hash, Pred&& pred) -> iterator {
+  uint32_t seg_id = SegmentId(key_hash);
+  if (auto seg_it = segment_[seg_id]->FindIt(key_hash, pred); seg_it.found()) {
+    return {this, seg_id, seg_it.index, seg_it.slot};
   }
-  return iterator{};
+  return {};
 }
 
 template <typename _Key, typename _Value, typename Policy>
@@ -657,7 +732,7 @@ size_t DashTable<_Key, _Value, Policy>::Erase(const Key_t& key) {
   uint64_t key_hash = DoHash(key);
   size_t x = SegmentId(key_hash);
   auto* target = segment_[x];
-  auto it = target->FindIt(key, key_hash, EqPred());
+  auto it = target->FindIt(key_hash, EqPred(key));
   if (!it.found())
     return 0;
 
@@ -684,7 +759,7 @@ void DashTable<_Key, _Value, Policy>::Erase(iterator it) {
 
 template <typename _Key, typename _Value, typename Policy>
 void DashTable<_Key, _Value, Policy>::Reserve(size_t size) {
-  if (size <= bucket_count())
+  if (size <= capacity())
     return;
 
   size_t sg_floor = (size - 1) / SegmentType::capacity();
@@ -699,30 +774,37 @@ void DashTable<_Key, _Value, Policy>::Reserve(size_t size) {
 
 template <typename _Key, typename _Value, typename Policy>
 template <typename U, typename V, typename EvictionPolicy>
-auto DashTable<_Key, _Value, Policy>::InsertInternal(U&& key, V&& value, EvictionPolicy& ev)
-    -> std::pair<iterator, bool> {
+auto DashTable<_Key, _Value, Policy>::InsertInternal(U&& key, V&& value, EvictionPolicy& ev,
+                                                     InsertMode mode) -> std::pair<iterator, bool> {
   uint64_t key_hash = DoHash(key);
-  uint32_t seg_id = SegmentId(key_hash);
+  uint32_t target_seg_id = SegmentId(key_hash);
 
   while (true) {
     // Keep last global_depth_ msb bits of the hash.
-    assert(seg_id < segment_.size());
-    SegmentType* target = segment_[seg_id];
+    assert(target_seg_id < segment_.size());
+    SegmentType* target = segment_[target_seg_id];
 
     // Load heap allocated segment data - to avoid TLB miss when accessing the bucket.
     __builtin_prefetch(target, 0, 1);
 
-    auto [it, res] =
-        target->Insert(std::forward<U>(key), std::forward<V>(value), key_hash, EqPred());
+    typename SegmentType::Iterator it;
+    bool res = true;
+    if (mode == InsertMode::kForceInsert) {
+      it = target->InsertUniq(std::forward<U>(key), std::forward<V>(value), key_hash, true);
+      res = it.found();
+    } else {
+      std::tie(it, res) =
+          target->Insert(std::forward<U>(key), std::forward<V>(value), key_hash, EqPred(key));
+    }
 
     if (res) {  // success
       ++size_;
-      return std::make_pair(iterator{this, seg_id, it.index, it.slot}, true);
+      return std::make_pair(iterator{this, target_seg_id, it.index, it.slot}, true);
     }
 
     /*duplicate insert, insertion failure*/
     if (it.found()) {
-      return std::make_pair(iterator{this, seg_id, it.index, it.slot}, false);
+      return std::make_pair(iterator{this, target_seg_id, it.index, it.slot}, false);
     }
 
     // At this point we must split the segment.
@@ -735,12 +817,12 @@ auto DashTable<_Key, _Value, Policy>::InsertInternal(U&& key, V&& value, Evictio
       hotspot.key_hash = key_hash;
 
       for (unsigned j = 0; j < HotspotBuckets::kRegularBuckets; ++j) {
-        hotspot.probes.by_type.regular_buckets[j] = bucket_iterator{this, seg_id, bid[j]};
+        hotspot.probes.by_type.regular_buckets[j] = bucket_iterator{this, target_seg_id, bid[j]};
       }
 
       for (unsigned i = 0; i < Policy::kStashBucketNum; ++i) {
         hotspot.probes.by_type.stash_buckets[i] =
-            bucket_iterator{this, seg_id, uint8_t(kLogicalBucketNum + i), 0};
+            bucket_iterator{this, target_seg_id, uint8_t(Policy::kBucketNum + i), 0};
       }
       hotspot.num_buckets = HotspotBuckets::kNumBuckets;
 
@@ -756,7 +838,7 @@ auto DashTable<_Key, _Value, Policy>::InsertInternal(U&& key, V&& value, Evictio
           /*unsigned start = (bid[HotspotBuckets::kNumBuckets - 1] + 1) % kLogicalBucketNum;
           for (unsigned i = 0; i < HotspotBuckets::kNumBuckets; ++i) {
             uint8_t id = (start + i) % kLogicalBucketNum;
-            buckets.probes.arr[i] = bucket_iterator{this, seg_id, id};
+            buckets.probes.arr[i] = bucket_iterator{this, target_seg_id, id};
           }
           garbage_collected_ += ev.GarbageCollect(buckets, this);
           */
@@ -790,12 +872,12 @@ auto DashTable<_Key, _Value, Policy>::InsertInternal(U&& key, V&& value, Evictio
     if (target->local_depth() == global_depth_) {
       IncreaseDepth(global_depth_ + 1);
 
-      seg_id = SegmentId(key_hash);
-      assert(seg_id < segment_.size() && segment_[seg_id] == target);
+      target_seg_id = SegmentId(key_hash);
+      assert(target_seg_id < segment_.size() && segment_[target_seg_id] == target);
     }
 
     ev.RecordSplit(target);
-    Split(seg_id);
+    Split(target_seg_id);
   }
 
   return std::make_pair(iterator{}, false);
@@ -823,7 +905,7 @@ void DashTable<_Key, _Value, Policy>::Split(uint32_t seg_id) {
   size_t chunk_size = 1u << (global_depth_ - source->local_depth());
   size_t start_idx = seg_id & (~(chunk_size - 1));
   assert(segment_[start_idx] == source && segment_[start_idx + chunk_size - 1] == source);
-  std::pmr::polymorphic_allocator<SegmentType> alloc(segment_.get_allocator().resource());
+  PMR_NS::polymorphic_allocator<SegmentType> alloc(segment_.get_allocator().resource());
   SegmentType* target = alloc.allocate(1);
   alloc.construct(target, source->local_depth() + 1);
 
@@ -839,12 +921,45 @@ void DashTable<_Key, _Value, Policy>::Split(uint32_t seg_id) {
 
 template <typename _Key, typename _Value, typename Policy>
 template <typename Cb>
-auto DashTable<_Key, _Value, Policy>::Traverse(cursor curs, Cb&& cb) -> cursor {
-  if (curs.bucket_id() >= kLogicalBucketNum)  // sanity.
-    return 0;
+auto DashTable<_Key, _Value, Policy>::TraverseBySegmentOrder(Cursor curs, Cb&& cb) -> Cursor {
+  uint32_t sid = curs.segment_id(global_depth_);
+  assert(sid < segment_.size());
+  SegmentType* s = segment_[sid];
+  assert(s);
+  uint8_t bid = curs.bucket_id();
 
+  auto dt_cb = [&](const SegmentIterator& it) { cb(iterator{this, sid, it.index, it.slot}); };
+  s->TraverseBucket(bid, std::move(dt_cb));
+
+  ++bid;
+  if (bid == SegmentType::kTotalBuckets) {
+    sid = NextSeg(sid);
+    bid = 0;
+    if (sid >= segment_.size()) {
+      return 0;  // "End of traversal" cursor.
+    }
+  }
+
+  return Cursor{global_depth_, sid, bid};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+auto DashTable<_Key, _Value, Policy>::GetRandomCursor(absl::BitGen* bitgen) -> Cursor {
+  uint32_t sid = absl::Uniform<uint32_t>(*bitgen, 0, segment_.size());
+  uint8_t bid = absl::Uniform<uint8_t>(*bitgen, 0, Policy::kBucketNum);
+
+  return Cursor{global_depth_, sid, bid};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+template <typename Cb>
+auto DashTable<_Key, _Value, Policy>::Traverse(Cursor curs, Cb&& cb) -> Cursor {
   uint32_t sid = curs.segment_id(global_depth_);
   uint8_t bid = curs.bucket_id();
+
+  // Test validity of the cursor.
+  if (bid >= Policy::kBucketNum || sid >= segment_.size())
+    return 0;
 
   auto hash_fun = [this](const auto& k) { return policy_.HashFn(k); };
 
@@ -863,22 +978,56 @@ auto DashTable<_Key, _Value, Policy>::Traverse(cursor curs, Cb&& cb) -> cursor {
       sid = 0;
       ++bid;
 
-      if (bid >= kLogicalBucketNum)
+      if (bid >= Policy::kBucketNum)
         return 0;  // "End of traversal" cursor.
     }
   } while (!fetched);
 
-  return cursor{global_depth_, sid, bid};
+  return Cursor{global_depth_, sid, bid};
+}
+
+template <typename _Key, typename _Value, typename Policy>
+auto DashTable<_Key, _Value, Policy>::AdvanceCursorBucketOrder(Cursor cursor) -> Cursor {
+  // We fix bid and go over all segments. Once we reach the end we increase bid and repeat.
+  uint32_t sid = cursor.segment_id(global_depth_);
+  uint8_t bid = cursor.bucket_id();
+  sid = NextSeg(sid);
+  if (sid >= segment_.size()) {
+    sid = 0;
+    ++bid;
+
+    if (bid >= SegmentType::kTotalBuckets)
+      return 0;  // "End of traversal" cursor.
+  }
+  return Cursor{global_depth_, sid, bid};
 }
 
 template <typename _Key, typename _Value, typename Policy>
 template <typename Cb>
-void DashTable<_Key, _Value, Policy>::TraverseBucket(const_iterator it, Cb&& cb) {
-  SegmentType& s = *segment_[it.seg_id_];
-  const auto& b = s.GetBucket(it.bucket_id_);
-  b.ForEachSlot([&](uint8_t slot, bool probe) {
-    cb(iterator{this, it.seg_id_, it.bucket_id_, slot});
-  });
+auto DashTable<_Key, _Value, Policy>::TraverseBuckets(Cursor cursor, Cb&& cb) -> Cursor {
+  if (cursor.bucket_id() >= SegmentType::kTotalBuckets)  // sanity.
+    return 0;
+
+  constexpr uint32_t kMaxIterations = 8;
+  bool invoked = false;
+
+  for (uint32_t i = 0; i < kMaxIterations; ++i) {
+    uint32_t sid = cursor.segment_id(global_depth_);
+    uint8_t bid = cursor.bucket_id();
+    SegmentType* s = segment_[sid];
+    assert(s);
+
+    const auto& bucket = s->GetBucket(bid);
+    if (bucket.GetBusy()) {  // Invoke callback only if bucket has elements.
+      cb(BucketIt(sid, bid));
+      invoked = true;
+    }
+
+    cursor = AdvanceCursorBucketOrder(cursor);
+    if (invoked || !cursor)  // Break end of traversal or callback invoked.
+      return cursor;
+  }
+  return cursor;
 }
 
 }  // namespace dfly

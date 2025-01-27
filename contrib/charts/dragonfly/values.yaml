@@ -47,11 +47,22 @@ securityContext: {}
   # runAsNonRoot: true
   # runAsUser: 1000
 
+# -- Set hostNetwork for pod
+hostNetwork: false
+
 service:
   # -- Service type to provision. Can be NodePort, ClusterIP or LoadBalancer
   type: ClusterIP
+  # -- Load balancer static ip to use when service type is set to LoadBalancer
+  loadBalancerIP: ""
+  # -- Cluster IP address to assign to the service. Leave empty to auto-allocate
+  clusterIP: ""
   # -- Dragonfly service port
   port: 6379
+  # -- Extra annotations for the service
+  annotations: {}
+  # -- Extra labels for the service
+  lablels: {}
   metrics:
     # -- name for the metrics port
     portName: metrics
@@ -65,6 +76,8 @@ serviceMonitor:
   namespace: ""
   # -- additional labels to apply to the metrics
   labels: {}
+  # -- additional annotations to apply to the metrics
+  annotations: {}
   # -- scrape interval
   interval: 10s
   # -- scrape timeout
@@ -88,6 +101,18 @@ storage:
 tls:
   # -- enable TLS
   enabled: false
+  # -- use cert-manager to automatically create the certificate
+  createCerts: false
+  # -- duration or ttl of the validity of the created certificate
+  duration: 87600h0m0s
+  issuer:
+    # -- cert-manager issuer kind. Usually Issuer or ClusterIssuer
+    kind: ClusterIssuer
+    # -- name of the referenced issuer
+    name: selfsigned
+    # -- group of the referenced issuer
+    # if you are using an external issuer, change this to that issuer group.
+    group: cert-manager.io
   # -- use TLS certificates from existing secret
   existing_secret: ""
   # -- TLS certificate
@@ -108,10 +133,39 @@ tls:
   #   HLunol88AeTOcKfD6hBYGvcRfu5NV29jJxZCOBfbFQXjnNlnrhRCag==
   #   -----END RSA PRIVATE KEY-----
 
+# If enabled will set DFLY_PASSOWRD environment variable with the specified existing secret value
+# Note that if enabled and the secret does not exist pods will not start
+passwordFromSecret:
+  enable: false
+  existingSecret:
+    name: ""
+    key: ""
 
-command:
-  # -- Allow overriding the container's command
-  set: []
+
+probes:
+  livenessProbe:
+    exec:
+      command:
+        - /bin/sh
+        - /usr/local/bin/healthcheck.sh
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+    successThreshold: 1
+  readinessProbe:
+    exec:
+      command:
+        - /bin/sh
+        - /usr/local/bin/healthcheck.sh
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+    successThreshold: 1
+
+# -- Allow overriding the container's command
+command: []
 
 # -- Extra arguments to pass to the dragonfly binary
 extraArgs: []
@@ -125,6 +179,18 @@ extraVolumeMounts: []
 # -- A list of initContainers to run before each pod starts
 initContainers: []
 
+# -- Additional sidecar containers
+extraContainers: []
+
+# -- extra K8s manifests to deploy
+extraObjects: []
+  # - apiVersion: cert-manager.io/v1
+  #   kind: ClusterIssuer
+  #   metadata:
+  #     name: selfsigned
+  #   spec:
+  #     selfSigned: {}
+
 resources:
   # -- The requested resources for the containers
   requests: {}
@@ -135,6 +201,15 @@ resources:
   #   cpu: 100m
   #   memory: 128Mi
 
+# -- extra environment variables
+env: []
+
+# -- extra environment variables from K8s objects
+envFrom: []
+
+# -- Priority class name for pod assignment
+priorityClassName: ""
+
 # -- Node labels for pod assignment
 nodeSelector: {}
 
@@ -143,3 +218,6 @@ tolerations: []
 
 # -- Affinity for pod assignment
 affinity: {}
+
+# -- Topology Spread Constraints for pod assignment
+topologySpreadConstraints: []

@@ -1,74 +1,70 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
 #pragma once
 
-#include "facade/op_status.h"
-#include "server/common.h"
-#include "server/table.h"
+#include "base/flags.h"
+#include "facade/facade_types.h"
+#include "server/tx_base.h"
 
-namespace util {
-class ProactorPool;
-}  // namespace util
+ABSL_DECLARE_FLAG(uint32_t, dbnum);
+
+namespace facade {
+class SinkReplyBuilder;
+};
 
 namespace dfly {
 
+using facade::CmdArgList;
 using facade::OpResult;
-using facade::OpStatus;
 
-class ConnectionContext;
 class CommandRegistry;
-class EngineShard;
+class Transaction;
+struct CommandContext;
 
 class GenericFamily {
  public:
-  static void Init(util::ProactorPool* pp);
-  static void Shutdown();
-
   static void Register(CommandRegistry* registry);
 
+  // Accessed by Service::Exec and Service::Watch as an utility.
+  static OpResult<uint32_t> OpExists(const OpArgs& op_args, const ShardArgs& keys);
+  static OpResult<uint32_t> OpDel(const OpArgs& op_args, const ShardArgs& keys);
+
  private:
-  enum TimeUnit { SEC, MSEC };
+  using SinkReplyBuilder = facade::SinkReplyBuilder;
 
-  struct ExpireParams {
-    int64_t ts;
-    bool absolute = false;
+  static void Del(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Unlink(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Ping(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Exists(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Expire(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ExpireAt(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Persist(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Keys(CmdArgList args, const CommandContext& cmd_cntx);
+  static void PexpireAt(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Pexpire(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Stick(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Sort(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Move(CmdArgList args, const CommandContext& cmd_cntx);
 
-    TimeUnit unit = SEC;
-  };
+  static void Rename(CmdArgList args, const CommandContext& cmd_cntx);
+  static void RenameNx(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ExpireTime(CmdArgList args, const CommandContext& cmd_cntx);
+  static void PExpireTime(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Ttl(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Pttl(CmdArgList args, const CommandContext& cmd_cntx);
 
-  static void Del(CmdArgList args, ConnectionContext* cntx);
-  static void Ping(CmdArgList args, ConnectionContext* cntx);
-  static void Exists(CmdArgList args, ConnectionContext* cntx);
-  static void Expire(CmdArgList args, ConnectionContext* cntx);
-  static void ExpireAt(CmdArgList args, ConnectionContext* cntx);
-  static void Keys(CmdArgList args, ConnectionContext* cntx);
-  static void PexpireAt(CmdArgList args, ConnectionContext* cntx);
-  static void Stick(CmdArgList args, ConnectionContext* cntx);
-
-  static void Rename(CmdArgList args, ConnectionContext* cntx);
-  static void RenameNx(CmdArgList args, ConnectionContext* cntx);
-  static void Ttl(CmdArgList args, ConnectionContext* cntx);
-  static void Pttl(CmdArgList args, ConnectionContext* cntx);
-
-  static void Echo(CmdArgList args, ConnectionContext* cntx);
-  static void Select(CmdArgList args, ConnectionContext* cntx);
-  static void Scan(CmdArgList args, ConnectionContext* cntx);
-  static void Type(CmdArgList args, ConnectionContext* cntx);
-
-  static OpResult<void> RenameGeneric(CmdArgList args, bool skip_exist_dest,
-                                      ConnectionContext* cntx);
-  static void TtlGeneric(CmdArgList args, ConnectionContext* cntx, TimeUnit unit);
-
-  static OpStatus OpExpire(const OpArgs& op_args, std::string_view key, const ExpireParams& params);
-
-  static OpResult<uint64_t> OpTtl(Transaction* t, EngineShard* shard, std::string_view key);
-  static OpResult<uint32_t> OpDel(const OpArgs& op_args, ArgSlice keys);
-  static OpResult<uint32_t> OpExists(const OpArgs& op_args, ArgSlice keys);
-  static OpResult<void> OpRen(const OpArgs& op_args, std::string_view from, std::string_view to,
-                              bool skip_exists);
-  static OpResult<uint32_t> OpStick(const OpArgs& op_args, ArgSlice keys);
+  static void Echo(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Select(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Scan(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Time(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Type(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Dump(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Restore(CmdArgList args, const CommandContext& cmd_cntx);
+  static void RandomKey(CmdArgList args, const CommandContext& cmd_cntx);
+  static void FieldTtl(CmdArgList args, const CommandContext& cmd_cntx);
+  static void FieldExpire(CmdArgList args, const CommandContext& cmd_cntx);
 };
 
 }  // namespace dfly

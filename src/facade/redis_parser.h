@@ -1,9 +1,13 @@
-// Copyright 2021, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 #pragma once
 
 #include <absl/container/inlined_vector.h>
+
+#include <memory>
+#include <utility>
+#include <vector>
 
 #include "facade/resp_expr.h"
 
@@ -18,22 +22,29 @@ namespace facade {
  */
 class RedisParser {
  public:
-  enum Result { OK, INPUT_PENDING, BAD_ARRAYLEN, BAD_BULKLEN, BAD_STRING, BAD_INT };
+  enum Result : uint8_t {
+    OK,
+    INPUT_PENDING,
+    BAD_ARRAYLEN,
+    BAD_BULKLEN,
+    BAD_STRING,
+    BAD_INT,
+    BAD_DOUBLE
+  };
   using Buffer = RespExpr::Buffer;
 
-  explicit RedisParser(bool server_mode = true) : server_mode_(server_mode) {
+  explicit RedisParser(uint32_t max_arr_len = UINT32_MAX, bool server_mode = true)
+      : server_mode_(server_mode), max_arr_len_(max_arr_len) {
   }
 
   /**
    * @brief Parses str into res. "consumed" stores number of bytes consumed from str.
    *
    * A caller should not invalidate str if the parser returns RESP_OK as long as he continues
-   * accessing res. However, if parser returns MORE_INPUT a caller may discard consumed
+   * accessing res. However, if parser returns INPUT_PENDING a caller may discard consumed
    * part of str because parser caches the intermediate state internally according to 'consumed'
    * result.
    *
-   * Note: A parser does not always guarantee progress, i.e. if a small buffer was passed it may
-   * returns MORE_INPUT with consumed == 0.
    *
    */
 
@@ -54,47 +65,57 @@ class RedisParser {
     return stash_;
   }
 
+  size_t UsedMemory() const;
+
  private:
-  void InitStart(uint8_t prefix_b, RespVec* res);
+  using ResultConsumed = std::pair<Result, uint32_t>;
+
+  // Returns true if this is a RESP message, false if INLINE.
+  bool InitStart(char prefix_b, RespVec* res);
   void StashState(RespVec* res);
 
   // Skips the first character (*).
-  Result ConsumeArrayLen(Buffer str);
-  Result ParseArg(Buffer str);
-  Result ConsumeBulk(Buffer str);
-  Result ParseInline(Buffer str);
+  ResultConsumed ConsumeArrayLen(Buffer str);
+  ResultConsumed ParseArg(Buffer str);
+  ResultConsumed ConsumeBulk(Buffer str);
+  ResultConsumed ParseInline(Buffer str);
+  ResultConsumed ParseLen(Buffer str, int64_t* res);
 
-  // Updates last_consumed_
-  Result ParseNum(Buffer str, int64_t* res);
   void HandleFinishArg();
   void ExtendLastString(Buffer str);
 
   enum State : uint8_t {
-    INIT_S = 0,
     INLINE_S,
     ARRAY_LEN_S,
-    PARSE_ARG_S,  // Parse [$:+-]string\r\n
+    MAP_LEN_S,
+    PARSE_ARG_TYPE,  // Parse [$:+-]
+    PARSE_ARG_S,     // Parse string\r\n
     BULK_STR_S,
-    FINISH_ARG_S,
+    SLASH_N_S,
     CMD_COMPLETE_S,
   };
 
-  State state_ = INIT_S;
-  Result last_result_ = OK;
+  State state_ = CMD_COMPLETE_S;
+  bool is_broken_token_ = false;  // true, if a token (inline or bulk) is broken during the parsing.
+  bool server_mode_ = true;
+  uint8_t small_len_ = 0;
+  char arg_c_ = 0;
 
-  uint32_t last_consumed_ = 0;
   uint32_t bulk_len_ = 0;
   uint32_t last_stashed_level_ = 0, last_stashed_index_ = 0;
+  uint32_t max_arr_len_;
+
+  // Points either to the result passed by the caller or to the stash.
+  RespVec* cached_expr_ = nullptr;
 
   // expected expression length, pointer to expression vector.
+  // For server mode, the length is at most 1.
   absl::InlinedVector<std::pair<uint32_t, RespVec*>, 4> parse_stack_;
   std::vector<std::unique_ptr<RespVec>> stash_;
 
-  using BlobPtr = std::unique_ptr<uint8_t[]>;
-  std::vector<BlobPtr> buf_stash_;
-  RespVec* cached_expr_ = nullptr;
-  bool is_broken_token_ = false;
-  bool server_mode_ = true;
+  using Blob = std::vector<uint8_t>;
+  std::vector<Blob> buf_stash_;
+  std::array<char, 32> small_buf_;
 };
 
 }  // namespace facade

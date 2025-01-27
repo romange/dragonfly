@@ -1,0 +1,118 @@
+name: daily-builds
+
+on:
+  # TODO: Remove this. This is for testing
+  schedule:
+    - cron: '0 6 * * *' # run at 6 AM UTC
+  workflow_dispatch:
+
+jobs:
+  build:
+    # The CMake configure and build commands are platform agnostic and should work equally
+    # well on Windows or Mac.  You can convert this to a matrix build if you need
+    # cross-platform coverage.
+    # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
+    runs-on: ubuntu-latest
+    name: Build ${{ matrix.name }}
+    strategy:
+      matrix:
+        include:
+          # Build with these flags
+          - name: generic
+            container: alpine-dev
+            flags: "-DMARCH_OPT=-march=x86-64"
+          - name: fedora
+            container: fedora:30
+
+    timeout-minutes: 45
+
+    container:
+      image: ghcr.io/romange/${{ matrix.container }}
+      options: --security-opt seccomp=unconfined
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Configure Cache Env
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '')
+
+      - name: Install dependencies
+        run: |
+          cmake --version
+          mkdir -p $GITHUB_WORKSPACE/build
+      - name: Install packages
+        if: matrix.container == 'fedora:30'
+        run: |
+          echo Passed
+
+      - name: Configure & Build
+        run: |
+          cd $GITHUB_WORKSPACE/build
+          cmake .. -DCMAKE_BUILD_TYPE=Debug -GNinja -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+             ${{ matrix.flags }}
+          ninja src/all
+      - name: Test
+        run: |
+            cd $GITHUB_WORKSPACE/build
+            ctest -V -L DFLY
+
+  build-macos:
+    runs-on: macos-13
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Configure Cache Env
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '')
+
+      - name: Install dependencies
+        run: |
+
+          # Remove Python3 symlinks in /usr/local/bin as workaround to brew update issues
+          # https://github.com/actions/setup-python/issues/577
+          rm /usr/local/bin/2to3* || :
+          rm /usr/local/bin/idle3* || :
+          rm /usr/local/bin/pydoc* || :
+          rm /usr/local/bin/python3* || :
+          brew update && brew install ninja boost automake zstd bison
+
+          mkdir -p $GITHUB_WORKSPACE/build
+
+      - name: Configure & Build
+        run: |
+          cd $GITHUB_WORKSPACE/build
+
+          export PATH=/usr/local/opt/bison/bin:$PATH
+          gcc-12 --version
+
+          bison --version
+
+          echo "*************************** START BUILDING **************************************"
+          CC=gcc-12 CXX=g++-12 cmake .. -DCMAKE_BUILD_TYPE=Debug -GNinja -DWITH_UNWIND=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_FLAGS="-Wl,-ld_classic"
+
+          ninja src/all
+
+      - name: Test
+        run: |
+            cd $GITHUB_WORKSPACE/build
+            ctest -V -L DFLY

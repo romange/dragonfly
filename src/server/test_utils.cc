@@ -1,13 +1,18 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
 #include "server/test_utils.h"
 
+#include "server/acl/acl_commands_def.h"
+#include "server/acl/acl_family.h"
+#include "util/fibers/fibers.h"
+
 extern "C" {
 #include "redis/zmalloc.h"
 }
 
+#include <absl/flags/reflection.h>
 #include <absl/strings/match.h>
 #include <absl/strings/str_split.h>
 #include <mimalloc.h>
@@ -16,13 +21,42 @@ extern "C" {
 #include "base/logging.h"
 #include "base/stl_util.h"
 #include "facade/dragonfly_connection.h"
-#include "util/uring/uring_pool.h"
+#include "io/file_util.h"
+#include "server/acl/acl_log.h"
+#include "util/fibers/pool.h"
 
 using namespace std;
 
 ABSL_DECLARE_FLAG(string, dbfilename);
-
+ABSL_DECLARE_FLAG(double, rss_oom_deny_ratio);
+ABSL_DECLARE_FLAG(uint32_t, num_shards);
+ABSL_FLAG(bool, force_epoll, false, "If true, uses epoll api instead iouring to run tests");
+ABSL_DECLARE_FLAG(uint32_t, acllog_max_len);
 namespace dfly {
+
+namespace {
+
+// Default stack size for fibers. We decrease it by 16 bytes because some allocators
+// need additional 8-16 bytes for their internal structures, thus over reserving additional
+// memory pages if using round sizes.
+#ifdef NDEBUG
+constexpr size_t kFiberDefaultStackSize = 32_KB - 16;
+#elif defined SANITIZERS
+// Increase stack size for sanitizers builds.
+constexpr size_t kFiberDefaultStackSize = 64_KB - 16;
+#else
+// Increase stack size for debug builds.
+constexpr size_t kFiberDefaultStackSize = 50_KB - 16;
+#endif
+
+}  // namespace
+
+std::ostream& operator<<(std::ostream& os, const DbStats& stats) {
+  os << "keycount: " << stats.key_count << ", tiered_size: " << stats.tiered_used_bytes
+     << ", tiered_entries: " << stats.tiered_entries << "\n";
+
+  return os;
+}
 
 extern unsigned kInitSegmentLog;
 
@@ -42,23 +76,38 @@ static vector<string> SplitLines(const std::string& src) {
 
 TestConnection::TestConnection(Protocol protocol)
     : facade::Connection(protocol, nullptr, nullptr, nullptr) {
+  cc_.reset(new dfly::ConnectionContext(this, {}));
+  cc_->skip_acl_validation = true;
+  SetSocket(ProactorBase::me()->CreateSocket());
+  OnConnectionStart();
 }
 
-void TestConnection::SendMsgVecAsync(const PubMessage& pmsg, util::fibers_ext::BlockingCounter bc) {
-  backing_str_.emplace_back(new string(pmsg.channel));
-  PubMessage dest;
-  dest.channel = *backing_str_.back();
+void TestConnection::SendPubMessageAsync(PubMessage pmsg) {
+  messages.push_back(std::move(pmsg));
+}
 
-  backing_str_.emplace_back(new string(pmsg.message));
-  dest.message = *backing_str_.back();
+void TestConnection::SendInvalidationMessageAsync(InvalidationMessage msg) {
+  invalidate_messages.push_back(std::move(msg));
+}
 
-  if (!pmsg.pattern.empty()) {
-    backing_str_.emplace_back(new string(pmsg.pattern));
-    dest.pattern = *backing_str_.back();
-  }
-  messages.push_back(dest);
+std::string TestConnection::RemoteEndpointStr() const {
+  return "";
+}
 
-  bc.Dec();
+void TransactionSuspension::Start() {
+  static CommandId cid{"TEST", CO::WRITE | CO::GLOBAL_TRANS, -1, 0, 0, acl::NONE};
+
+  transaction_ = new dfly::Transaction{&cid};
+
+  auto st = transaction_->InitByArgs(&namespaces->GetDefaultNamespace(), 0, {});
+  CHECK_EQ(st, OpStatus::OK);
+
+  transaction_->Execute([](Transaction* t, EngineShard* shard) { return OpStatus::OK; }, false);
+}
+
+void TransactionSuspension::Terminate() {
+  transaction_->Conclude();
+  transaction_ = nullptr;
 }
 
 class BaseFamilyTest::TestConnWrapper {
@@ -71,10 +120,14 @@ class BaseFamilyTest::TestConnWrapper {
   RespVec ParseResponse(bool fully_consumed);
 
   // returns: type(pmessage), pattern, channel, message.
-  facade::Connection::PubMessage GetPubMessage(size_t index) const;
+  const facade::Connection::PubMessage& GetPubMessage(size_t index) const;
+
+  const facade::Connection::InvalidationMessage& GetInvalidationMessage(size_t index) const;
 
   ConnectionContext* cmd_cntx() {
-    return &cmd_cntx_;
+    auto cntx = static_cast<ConnectionContext*>(dummy_conn_->cntx());
+    cntx->ns = &namespaces->GetDefaultNamespace();
+    return cntx;
   }
 
   StringVec SplitLines() const {
@@ -89,19 +142,31 @@ class BaseFamilyTest::TestConnWrapper {
     return dummy_conn_.get();
   }
 
+  SinkReplyBuilder* builder() {
+    return builder_.get();
+  }
+
  private:
   ::io::StringSink sink_;  // holds the response blob
 
   std::unique_ptr<TestConnection> dummy_conn_;
 
-  ConnectionContext cmd_cntx_;
   std::vector<std::unique_ptr<std::string>> tmp_str_vec_;
 
   std::unique_ptr<RedisParser> parser_;
+  std::unique_ptr<SinkReplyBuilder> builder_;
 };
 
 BaseFamilyTest::TestConnWrapper::TestConnWrapper(Protocol proto)
-    : dummy_conn_(new TestConnection(proto)), cmd_cntx_(&sink_, dummy_conn_.get()) {
+    : dummy_conn_(new TestConnection(proto)) {
+  switch (proto) {
+    case Protocol::REDIS:
+      builder_.reset(new RedisReplyBuilder{&sink_});
+      break;
+    case Protocol::MEMCACHE:
+      builder_.reset(new MCReplyBuilder{&sink_});
+      break;
+  }
 }
 
 BaseFamilyTest::TestConnWrapper::~TestConnWrapper() {
@@ -118,65 +183,262 @@ BaseFamilyTest::~BaseFamilyTest() {
 void BaseFamilyTest::SetUpTestSuite() {
   kInitSegmentLog = 1;
 
+  absl::SetFlag(&FLAGS_rss_oom_deny_ratio, -1);
   absl::SetFlag(&FLAGS_dbfilename, "");
+
+  static bool init = true;
+  if (exchange(init, false)) {
+    fb2::SetDefaultStackResource(&fb2::std_malloc_resource, kFiberDefaultStackSize);
+  }
+
   init_zmalloc_threadlocal(mi_heap_get_backing());
+
+  // TODO: go over all env variables starting with FLAGS_ and make sure they are in the below list.
+  static constexpr const char* kEnvFlags[] = {
+      "cluster_mode",
+      "lock_on_hashtags",
+      "force_epoll",
+  };
+  for (string_view flag : kEnvFlags) {
+    const char* value = getenv(absl::StrCat("FLAGS_", flag).data());
+    if (value != nullptr) {
+      SetTestFlag(flag, value);
+    }
+  }
 }
 
 void BaseFamilyTest::SetUp() {
-  pp_.reset(new uring::UringPool(16, num_threads_));
-  pp_->Run();
-  service_.reset(new Service{pp_.get()});
-
-  Service::InitOpts opts;
-  opts.disable_time_update = true;
-  service_->Init(nullptr, nullptr, opts);
-
-  expire_now_ = absl::GetCurrentTimeNanos() / 1000000;
-  auto cb = [&](EngineShard* s) {
-    s->db_slice().UpdateExpireBase(expire_now_ - 1000, 0);
-    s->db_slice().UpdateExpireClock(expire_now_);
-  };
-  shard_set->RunBriefInParallel(cb);
-
-  const TestInfo* const test_info = UnitTest::GetInstance()->current_test_info();
-  LOG(INFO) << "Starting " << test_info->name();
+  max_memory_limit = INT_MAX;
+  ResetService();
 }
 
 void BaseFamilyTest::TearDown() {
-  service_->Shutdown();
-  service_.reset();
-  pp_->Stop();
+  CHECK_EQ(NumLocked(), 0U);
+
+  ShutdownService();
 
   const TestInfo* const test_info = UnitTest::GetInstance()->current_test_info();
   LOG(INFO) << "Finishing " << test_info->name();
 }
 
-// ts is ms
-void BaseFamilyTest::UpdateTime(uint64_t ms) {
-  auto cb = [ms](EngineShard* s) { s->db_slice().UpdateExpireClock(ms); };
+void BaseFamilyTest::ResetService() {
+  if (service_ != nullptr) {
+    TEST_InvalidateLockTagOptions();
+
+    ShutdownService();
+  }
+
+#ifdef __linux__
+  if (absl::GetFlag(FLAGS_force_epoll)) {
+    pp_.reset(fb2::Pool::Epoll(num_threads_));
+  } else {
+    pp_.reset(fb2::Pool::IOUring(16, num_threads_));
+  }
+#else
+  pp_.reset(fb2::Pool::Epoll(num_threads_));
+#endif
+
+  // Using a different default than production could expose bugs
+  if (absl::GetFlag(FLAGS_num_shards) == 0) {
+    absl::SetFlag(&FLAGS_num_shards, num_threads_ - 1);
+  }
+  pp_->Run();
+  service_ = std::make_unique<Service>(pp_.get());
+
+  service_->Init(nullptr, {});
+  used_mem_current = 0;
+
+  TEST_current_time_ms = absl::GetCurrentTimeNanos() / 1000000;
+  auto default_ns = &namespaces->GetDefaultNamespace();
+  auto cb = [&](EngineShard* s) {
+    default_ns->GetDbSlice(s->shard_id()).UpdateExpireBase(TEST_current_time_ms - 1000, 0);
+  };
   shard_set->RunBriefInParallel(cb);
+
+  const TestInfo* const test_info = UnitTest::GetInstance()->current_test_info();
+  LOG(INFO) << "Starting " << test_info->name();
+
+  watchdog_fiber_ = pp_->GetNextProactor()->LaunchFiber([this] {
+    ThisFiber::SetName("Watchdog");
+
+    if (!watchdog_done_.WaitFor(20s)) {
+      LOG(ERROR) << "Deadlock detected!!!!";
+      absl::SetFlag(&FLAGS_alsologtostderr, true);
+      fb2::Mutex m;
+      shard_set->pool()->AwaitFiberOnAll([&m](unsigned index, ProactorBase* base) {
+        ThisFiber::SetName("Watchdog");
+        std::unique_lock lk(m);
+        LOG(ERROR) << "Proactor " << index << ":\n";
+        fb2::detail::FiberInterface::PrintAllFiberStackTraces();
+        EngineShard* es = EngineShard::tlocal();
+
+        if (es != nullptr) {
+          TxQueue* txq = es->txq();
+          if (!txq->Empty()) {
+            LOG(ERROR) << "TxQueue for shard " << es->shard_id();
+
+            auto head = txq->Head();
+            auto it = head;
+            do {
+              Transaction* trans = std::get<Transaction*>(es->txq()->At(it));
+              LOG(ERROR) << "Transaction " << trans->DebugId(es->shard_id());
+              it = txq->Next(it);
+            } while (it != head);
+          }
+
+          LOG(ERROR) << "TxLocks for shard " << es->shard_id();
+          for (const auto& k_v : namespaces->GetDefaultNamespace()
+                                     .GetDbSlice(es->shard_id())
+                                     .GetDBTable(0)
+                                     ->trans_locks) {
+            LOG(ERROR) << "Key " << k_v.first << " " << k_v.second;
+          }
+        }
+      });
+    }
+  });
+}
+
+void BaseFamilyTest::ShutdownService() {
+  if (service_ == nullptr) {
+    return;
+  }
+
+  // Don't save files during shutdown
+  CleanupSnapshots();
+  absl::SetFlag(&FLAGS_dbfilename, "");
+
+  service_->Shutdown();
+  service_.reset();
+
+  delete shard_set;
+  shard_set = nullptr;
+
+  watchdog_done_.Notify();
+  watchdog_fiber_.Join();
+
+  pp_->Stop();
+}
+
+void BaseFamilyTest::InitWithDbFilename() {
+  ShutdownService();
+
+  absl::SetFlag(&FLAGS_dbfilename, "rdbtestdump");
+  CleanupSnapshots();
+  ResetService();
+}
+
+void BaseFamilyTest::CleanupSnapshots() {
+  string dbfilename = absl::GetFlag(FLAGS_dbfilename);
+  if (dbfilename.empty())
+    return;
+
+  auto rdb_files = io::StatFiles(absl::StrCat(dbfilename, "*"));
+  CHECK(rdb_files);
+  for (const auto& fl : *rdb_files) {
+    unlink(fl.name.c_str());
+  }
+}
+
+unsigned BaseFamilyTest::NumLocked() {
+  atomic_uint count = 0;
+  auto default_ns = &namespaces->GetDefaultNamespace();
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    for (const auto& db : default_ns->GetDbSlice(shard->shard_id()).databases()) {
+      if (db == nullptr) {
+        continue;
+      }
+      count += db->trans_locks.Size();
+    }
+  });
+  return count;
+}
+
+void BaseFamilyTest::ClearMetrics() {
+  shard_set->pool()->AwaitBrief([](unsigned, auto*) {
+    ServerState::tlocal()->stats = ServerState::Stats(shard_set->size());
+  });
+}
+
+void BaseFamilyTest::WaitUntilLocked(DbIndex db_index, string_view key, double timeout) {
+  auto step = 50us;
+  auto timeout_micro = chrono::duration_cast<chrono::microseconds>(1000ms * timeout);
+  int64_t steps = timeout_micro.count() / step.count();
+  do {
+    ThisFiber::SleepFor(step);
+  } while (!IsLocked(db_index, key) && --steps > 0);
+  CHECK(IsLocked(db_index, key));
+}
+
+bool BaseFamilyTest::WaitUntilCondition(std::function<bool()> condition_cb,
+                                        std::chrono::milliseconds timeout_ms) {
+  auto step = 50us;
+  auto timeout_micro = chrono::duration_cast<chrono::microseconds>(timeout_ms);
+  int64_t steps = timeout_micro.count() / step.count();
+  do {
+    ThisFiber::SleepFor(step);
+  } while (!condition_cb() && --steps > 0);
+  return condition_cb();
 }
 
 RespExpr BaseFamilyTest::Run(ArgSlice list) {
   if (!ProactorBase::IsProactorThread()) {
-    return pp_->at(0)->Await([&] { return this->Run(list); });
+    return pp_->at(0)->Await([&] {
+      ThisFiber::SetName("Test::Run");
+      return this->Run(list);
+    });
   }
 
   return Run(GetId(), list);
 }
 
+RespExpr BaseFamilyTest::RunPrivileged(std::initializer_list<const std::string_view> list) {
+  if (!ProactorBase::IsProactorThread()) {
+    return pp_->at(0)->Await([&] { return this->RunPrivileged(list); });
+  }
+  string id = GetId();
+  TestConnWrapper* conn_wrapper = AddFindConn(Protocol::REDIS, id);
+  // Before running the command set the connection as admin connection
+  conn_wrapper->conn()->SetPrivileged(true);
+  auto res = Run(id, ArgSlice{list.begin(), list.size()});
+  // After running the command set the connection as non admin connection
+  // because the connction is returned to the poll. This way the next call to Run from the same
+  // thread will not have the connection set as admin.
+  conn_wrapper->conn()->SetPrivileged(false);
+  return res;
+}
+
+RespExpr BaseFamilyTest::Run(absl::Span<std::string> span) {
+  vector<string_view> sv_vec(span.size());
+  for (unsigned i = 0; i < span.size(); ++i) {
+    sv_vec[i] = span[i];
+  }
+  return Run(sv_vec);
+}
+
 RespExpr BaseFamilyTest::Run(std::string_view id, ArgSlice slice) {
+  if (!ProactorBase::IsProactorThread()) {
+    return pp_->at(0)->Await([&] { return this->Run(id, slice); });
+  }
+
   TestConnWrapper* conn_wrapper = AddFindConn(Protocol::REDIS, id);
 
   CmdArgVec args = conn_wrapper->Args(slice);
 
   auto* context = conn_wrapper->cmd_cntx();
+  context->ns = &namespaces->GetDefaultNamespace();
+
+  DCHECK(context->transaction == nullptr) << id;
+
+  service_->DispatchCommand(CmdArgList{args}, conn_wrapper->builder(), context);
 
   DCHECK(context->transaction == nullptr);
 
-  service_->DispatchCommand(CmdArgList{args}, context);
-
-  DCHECK(context->transaction == nullptr);
+  auto cmd = absl::AsciiStrToUpper(slice.front());
+  if (cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVAL_RO" || cmd == "EVALSHA_RO" ||
+      cmd == "EXEC") {
+    shard_set->AwaitRunningOnShardQueue([](auto*) {});  // Wait for async UnlockMulti.
+  }
 
   unique_lock lk(mu_);
   last_cmd_dbg_info_ = context->last_command_debug;
@@ -212,7 +474,7 @@ auto BaseFamilyTest::RunMC(MP::CmdType cmd_type, string_view key, string_view va
 
   DCHECK(context->transaction == nullptr);
 
-  service_->DispatchMC(cmd, value, context);
+  service_->DispatchMC(cmd, value, static_cast<MCReplyBuilder*>(conn->builder()), context);
 
   DCHECK(context->transaction == nullptr);
 
@@ -224,16 +486,7 @@ auto BaseFamilyTest::RunMC(MP::CmdType cmd_type, std::string_view key) -> MCResp
     return pp_->at(0)->Await([&] { return this->RunMC(cmd_type, key); });
   }
 
-  MP::Command cmd;
-  cmd.type = cmd_type;
-  cmd.key = key;
-  TestConnWrapper* conn = AddFindConn(Protocol::MEMCACHE, GetId());
-
-  auto* context = conn->cmd_cntx();
-
-  service_->DispatchMC(cmd, string_view{}, context);
-
-  return conn->SplitLines();
+  return RunMC(cmd_type, key, string_view{}, 0, chrono::seconds{});
 }
 
 auto BaseFamilyTest::GetMC(MP::CmdType cmd_type, std::initializer_list<std::string_view> list)
@@ -256,13 +509,12 @@ auto BaseFamilyTest::GetMC(MP::CmdType cmd_type, std::initializer_list<std::stri
   TestConnWrapper* conn = AddFindConn(Protocol::MEMCACHE, GetId());
 
   auto* context = conn->cmd_cntx();
-
-  service_->DispatchMC(cmd, string_view{}, context);
+  service_->DispatchMC(cmd, string_view{}, static_cast<MCReplyBuilder*>(conn->builder()), context);
 
   return conn->SplitLines();
 }
 
-int64_t BaseFamilyTest::CheckedInt(std::initializer_list<std::string_view> list) {
+int64_t BaseFamilyTest::CheckedInt(ArgSlice list) {
   RespExpr resp = Run(list);
   if (resp.type == RespExpr::INT64) {
     return get<int64_t>(resp.u);
@@ -276,6 +528,12 @@ int64_t BaseFamilyTest::CheckedInt(std::initializer_list<std::string_view> list)
   int64_t res;
   CHECK(absl::SimpleAtoi(sv, &res)) << "|" << sv << "|";
   return res;
+}
+
+string BaseFamilyTest::CheckedString(ArgSlice list) {
+  RespExpr resp = Run(list);
+  CHECK_EQ(RespExpr::STRING, int(resp.type)) << list;
+  return string{ToSV(resp.GetBuf())};
 }
 
 CmdArgVec BaseFamilyTest::TestConnWrapper::Args(ArgSlice list) {
@@ -307,36 +565,40 @@ RespVec BaseFamilyTest::TestConnWrapper::ParseResponse(bool fully_consumed) {
   tmp_str_vec_.emplace_back(new string{sink_.str()});
   auto& s = *tmp_str_vec_.back();
   auto buf = RespExpr::buffer(&s);
-  uint32_t consumed = 0;
 
-  parser_.reset(new RedisParser{false});  // Client mode.
+  auto s_copy = s;
+
+  uint32_t consumed = 0;
+  parser_.reset(new RedisParser{UINT32_MAX, false});  // Client mode.
   RespVec res;
   RedisParser::Result st = parser_->Parse(buf, &consumed, &res);
-  CHECK_EQ(RedisParser::OK, st);
+
+  CHECK_EQ(RedisParser::OK, st) << " response: \"" << s_copy << "\" (" << s_copy.size()
+                                << " chars)";
   if (fully_consumed) {
     DCHECK_EQ(consumed, s.size()) << s;
   }
   return res;
 }
 
-facade::Connection::PubMessage BaseFamilyTest::TestConnWrapper::GetPubMessage(size_t index) const {
+const facade::Connection::PubMessage& BaseFamilyTest::TestConnWrapper::GetPubMessage(
+    size_t index) const {
   CHECK_LT(index, dummy_conn_->messages.size());
   return dummy_conn_->messages[index];
 }
 
+const facade::Connection::InvalidationMessage&
+BaseFamilyTest::TestConnWrapper::GetInvalidationMessage(size_t index) const {
+  CHECK_LT(index, dummy_conn_->invalidate_messages.size());
+  return dummy_conn_->invalidate_messages[index];
+}
+
 bool BaseFamilyTest::IsLocked(DbIndex db_index, std::string_view key) const {
-  ShardId sid = Shard(key, shard_set->size());
-  KeyLockArgs args;
-  args.db_index = db_index;
-  args.args = ArgSlice{&key, 1};
-  args.key_step = 1;
-  bool is_open = pp_->at(sid)->AwaitBrief(
-      [args] { return EngineShard::tlocal()->db_slice().CheckLock(IntentLock::EXCLUSIVE, args); });
-  return !is_open;
+  return service_->IsLocked(&namespaces->GetDefaultNamespace(), db_index, key);
 }
 
 string BaseFamilyTest::GetId() const {
-  int32 id = ProactorBase::GetIndex();
+  int32 id = ProactorBase::me()->GetPoolIndex();
   CHECK_GE(id, 0);
   return absl::StrCat("IO", id);
 }
@@ -349,15 +611,27 @@ size_t BaseFamilyTest::SubscriberMessagesLen(string_view conn_id) const {
   return it->second->conn()->messages.size();
 }
 
-facade::Connection::PubMessage BaseFamilyTest::GetPublishedMessage(string_view conn_id,
-                                                                   size_t index) const {
-  facade::Connection::PubMessage res;
-
+size_t BaseFamilyTest::InvalidationMessagesLen(string_view conn_id) const {
   auto it = connections_.find(conn_id);
   if (it == connections_.end())
-    return res;
+    return 0;
+
+  return it->second->conn()->invalidate_messages.size();
+}
+
+const facade::Connection::PubMessage& BaseFamilyTest::GetPublishedMessage(string_view conn_id,
+                                                                          size_t index) const {
+  auto it = connections_.find(conn_id);
+  CHECK(it != connections_.end());
 
   return it->second->GetPubMessage(index);
+}
+
+const facade::Connection::InvalidationMessage& BaseFamilyTest::GetInvalidationMessage(
+    string_view conn_id, size_t index) const {
+  auto it = connections_.find(conn_id);
+  CHECK(it != connections_.end());
+  return it->second->GetInvalidationMessage(index);
 }
 
 ConnectionContext::DebugInfo BaseFamilyTest::GetDebugInfo(const std::string& id) const {
@@ -368,6 +642,8 @@ ConnectionContext::DebugInfo BaseFamilyTest::GetDebugInfo(const std::string& id)
 }
 
 auto BaseFamilyTest::AddFindConn(Protocol proto, std::string_view id) -> TestConnWrapper* {
+  DCHECK(ProactorBase::IsProactorThread());
+
   unique_lock lk(mu_);
 
   auto [it, inserted] = connections_.emplace(id, nullptr);
@@ -392,6 +668,83 @@ vector<string> BaseFamilyTest::StrArray(const RespExpr& expr) {
   }
 
   return res;
+}
+
+vector<LockFp> BaseFamilyTest::GetLastFps() {
+  fb2::Mutex mu;
+  vector<LockFp> result;
+
+  auto add_keys = [&](ProactorBase* proactor) {
+    EngineShard* shard = EngineShard::tlocal();
+    if (shard == nullptr) {
+      return;
+    }
+
+    lock_guard lk(mu);
+    for (auto fp :
+         namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id()).TEST_GetLastLockedFps()) {
+      result.push_back(fp);
+    }
+  };
+  shard_set->pool()->AwaitFiberOnAll(add_keys);
+
+  return result;
+}
+
+void BaseFamilyTest::ExpectConditionWithinTimeout(const std::function<bool()>& condition,
+                                                  absl::Duration timeout) {
+  absl::Time deadline = absl::Now() + timeout;
+
+  while (deadline > absl::Now()) {
+    if (condition()) {
+      break;
+    }
+    ThisFiber::SleepFor(5ms);
+  }
+
+  EXPECT_LE(absl::Now(), deadline)
+      << "Timeout of " << timeout << " reached when expecting condition";
+}
+
+fb2::Fiber BaseFamilyTest::ExpectConditionWithSuspension(const std::function<bool()>& condition) {
+  TransactionSuspension tx;
+  pp_->at(0)->Await([&] { tx.Start(); });
+
+  auto fb =
+      pp_->at(0)->LaunchFiber(fb2::Launch::dispatch, [condition, tx = std::move(tx)]() mutable {
+        ExpectConditionWithinTimeout(condition);
+        tx.Terminate();
+      });
+  return fb;
+}
+
+util::fb2::Fiber BaseFamilyTest::ExpectUsedKeys(const std::vector<std::string_view>& keys) {
+  vector<LockFp> key_fps;
+  for (const auto& k : keys) {
+    key_fps.push_back(LockTag(k).Fingerprint());
+  }
+  sort(key_fps.begin(), key_fps.end());
+  auto cb = [=] {
+    auto last_fps = GetLastFps();
+    sort(last_fps.begin(), last_fps.end());
+    return last_fps == key_fps;
+  };
+
+  return ExpectConditionWithSuspension(std::move(cb));
+}
+
+void BaseFamilyTest::SetTestFlag(string_view flag_name, string_view new_value) {
+  auto* flag = absl::FindCommandLineFlag(flag_name);
+  CHECK_NE(flag, nullptr);
+  VLOG(1) << "Changing flag " << flag_name << " from " << flag->CurrentValue() << " to "
+          << new_value;
+  string error;
+  CHECK(flag->ParseFrom(new_value, &error)) << "Error: " << error;
+}
+
+const acl::AclFamily* BaseFamilyTest::TestInitAclFam() {
+  absl::SetFlag(&FLAGS_acllog_max_len, 0);
+  return service_->TestInit();
 }
 
 }  // namespace dfly

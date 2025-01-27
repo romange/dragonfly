@@ -40,7 +40,11 @@
  * This should be the size of the buffer given to ld2string */
 #define MAX_LONG_DOUBLE_CHARS 5*1024
 
-/* long double to string convertion options */
+/* Error codes */
+#define C_OK                    0
+#define C_ERR                   -1
+
+/* long double to string conversion options */
 typedef enum {
     LD_STR_AUTO,     /* %.17Lg */
     LD_STR_HUMAN,    /* %.17Lf + Trimming of trailing zeros */
@@ -63,9 +67,6 @@ int string2ld(const char *s, size_t slen, long double *dp);
 int d2string(char *buf, size_t len, double value);
 int ld2string(char *buf, size_t len, long double value, ld2string_mode mode);
 
-long getTimeZone(void);
-int pathIsBaseName(char *path);
-
 #define LOG_MAX_LEN    1024 /* Default maximum length of syslog messages.*/
 
 /* Log levels */
@@ -80,58 +81,17 @@ int pathIsBaseName(char *path);
 #define LRU_CLOCK_MAX ((1<<LRU_BITS)-1) /* Max value of obj->lru */
 #define LRU_CLOCK_RESOLUTION 1000 /* LRU clock resolution in ms */
 
+/* Bytes needed for long -> str + '\0' */
+#define LONG_STR_SIZE 21
+
 void serverLog(int level, const char *fmt, ...);
 void _serverPanic(const char *file, int line, const char *msg, ...);
 void _serverAssert(const char *estr, const char *file, int line);
-void serverLogHexDump(int level, char *descr, void *value, size_t len);
 
 #define serverPanic(...) _serverPanic(__FILE__,__LINE__,__VA_ARGS__),_exit(1)
 #define serverAssert(_e) ((_e)?(void)0 : (_serverAssert(#_e,__FILE__,__LINE__),_exit(1)))
 
-extern int verbosity;
-
 typedef long long mstime_t; /* millisecond time type. */
-unsigned int LRU_CLOCK(void);
-void debugDelay(int usec);
-long long ustime(void);
 
-/* Return the current time in minutes, just taking the least significant
- * 16 bits. The returned time is suitable to be stored as LDT (last decrement
- * time) for the LFU implementation. */
-static inline unsigned long LFUGetTimeInMinutesT(size_t sec) {
-    return (sec / 60) & 65535;
-}
-
-static inline unsigned long LFUGetTimeInMinutes() {
-    return LFUGetTimeInMinutesT(time(NULL));
-}
-
-/* Given an object last access time, compute the minimum number of minutes
- * that elapsed since the last access. Handle overflow (ldt greater than
- * the current 16 bits minutes time) considering the time as wrapping
- * exactly once. */
-static inline unsigned long LFUTimeElapsed(time_t sec, unsigned long ldt) {
-    unsigned long now = LFUGetTimeInMinutesT(sec);
-    if (now >= ldt) return now-ldt;
-    return 65535-ldt+now;
-}
-
-
-/* Return the UNIX time in milliseconds */
-static inline mstime_t mstime(void) {
-  return ustime()/1000;
-}
-
-/* Return the LRU clock, based on the clock resolution. This is a time
- * in a reduced-bits format that can be used to set and check the
- * object->lru field of redisObject structures. */
-static inline unsigned int getLRUClock(void) {
-    int64_t t = time(NULL);
-    return t & LRU_CLOCK_MAX;
-}
-
-#ifdef REDIS_TEST
-int utilTest(int argc, char **argv, int accurate);
-#endif
 
 #endif

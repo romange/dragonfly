@@ -38,7 +38,6 @@
 #include <math.h>
 #include "rax.h"
 
-#include "endianconv.h"
 
 #ifndef RAX_MALLOC_INCLUDE
 #define RAX_MALLOC_INCLUDE "rax_malloc.h"
@@ -156,7 +155,7 @@ static inline void raxStackFree(raxStack *ts) {
  * 'nodesize'. The padding is needed to store the child pointers to aligned
  * addresses. Note that we add 4 to the node size because the node has a four
  * bytes header. */
-#define raxPadding(nodesize) ((sizeof(void*)-((nodesize+4) % sizeof(void*))) & (sizeof(void*)-1))
+#define raxPadding(nodesize) ((sizeof(void*)-(((nodesize)+4) % sizeof(void*))) & (sizeof(void*)-1))
 
 /* Return the pointer to the last child pointer in a node. For the compressed
  * nodes this is the only child pointer. */
@@ -354,7 +353,7 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr, raxNode **
      * we don't need to do anything if there was already some padding to use. In
      * that case the final destination of the pointers will be the same, however
      * in our example there was no pre-existing padding, so we added one byte
-     * plus there bytes of padding. After the next memmove() things will look
+     * plus three bytes of padding. After the next memmove() things will look
      * like that:
      *
      * [HDR*][abde][....][Aptr][Bptr][....][Dptr][Eptr]|AUXP|
@@ -1222,29 +1221,44 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
 
 /* This is the core of raxFree(): performs a depth-first scan of the
  * tree and releases all the nodes found. */
-void raxRecursiveFree(rax *rax, raxNode *n, void (*free_callback)(void*)) {
+void raxRecursiveFree(rax *rax, raxNode *n, void (*free_callback)(void*, void*), void* argument) {
     debugnode("free traversing",n);
     int numchildren = n->iscompr ? 1 : n->size;
     raxNode **cp = raxNodeLastChildPtr(n);
     while(numchildren--) {
         raxNode *child;
         memcpy(&child,cp,sizeof(child));
-        raxRecursiveFree(rax,child,free_callback);
+        raxRecursiveFree(rax,child,free_callback,argument);
         cp--;
     }
     debugnode("free depth-first",n);
     if (free_callback && n->iskey && !n->isnull)
-        free_callback(raxGetData(n));
+        free_callback(raxGetData(n),argument);
     rax_free(n);
     rax->numnodes--;
+}
+
+/* Free the entire radix tree, invoking a free_callback function for each key's data. 
+ * An additional argument is passed to the free_callback function.*/
+ void raxFreeWithCallbackAndArgument(rax *rax, void (*free_callback)(void*, void*), void* argument) {
+    raxRecursiveFree(rax,rax->head,free_callback,argument);
+    assert(rax->numnodes == 0);
+    rax_free(rax);
+}
+
+/* Wrapper for the callback to adapt it for the context */
+void freeCallbackWrapper(void* data, void* argument) {
+    if (!argument) {
+        return;
+    }
+    void (*free_callback)(void*) = (void (*)(void*))argument;
+    free_callback(data);
 }
 
 /* Free a whole radix tree, calling the specified callback in order to
  * free the auxiliary data. */
 void raxFreeWithCallback(rax *rax, void (*free_callback)(void*)) {
-    raxRecursiveFree(rax,rax->head,free_callback);
-    assert(rax->numnodes == 0);
-    rax_free(rax);
+    raxFreeWithCallbackAndArgument(rax, freeCallbackWrapper, (void*)free_callback);
 }
 
 /* Free a whole radix tree. */

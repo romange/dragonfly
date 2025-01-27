@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+FROM ghcr.io/romange/ubuntu-dev:20 AS builder
+
+WORKDIR /build
+
+COPY ./Makefile ./CMakeLists.txt ./
+COPY src ./src
+COPY cmake ./cmake
+COPY helio ./helio
+
+RUN make release
+
+RUN build-release/dragonfly --version
+
+FROM ubuntu:22.04
+
+RUN --mount=type=tmpfs,target=/var/cache/apt \
+    --mount=type=tmpfs,target=/var/lib/apt/lists \
+    apt update && \
+    apt install -q -y --no-install-recommends netcat-openbsd ca-certificates redis-tools net-tools
+
+RUN groupadd -r -g 999 dfly && useradd -r -g dfly -u 999 dfly
+RUN mkdir /data && chown dfly:dfly /data
+
+VOLUME /data
+WORKDIR /data
+
+COPY tools/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY tools/docker/healthcheck.sh /usr/local/bin/healthcheck.sh
+COPY --from=builder /build/build-release/dragonfly /usr/local/bin/
+
+HEALTHCHECK CMD /usr/local/bin/healthcheck.sh
+ENTRYPOINT ["entrypoint.sh"]
+
+# For inter-container communication.
+EXPOSE 6379
+
+CMD ["dragonfly", "--logtostderr"]

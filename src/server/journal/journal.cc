@@ -1,4 +1,4 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -8,7 +8,7 @@
 
 #include "base/logging.h"
 #include "server/engine_shard_set.h"
-#include "server/journal/journal_shard.h"
+#include "server/journal/journal_slice.h"
 #include "server/server_state.h"
 
 namespace dfly {
@@ -17,56 +17,33 @@ namespace journal {
 namespace fs = std::filesystem;
 using namespace std;
 using namespace util;
-namespace fibers = boost::fibers;
 
 namespace {
 
-thread_local JournalShard journal_shard;
+// Present in all threads (not only in shard threads).
+thread_local JournalSlice journal_slice;
 
 }  // namespace
 
 Journal::Journal() {
 }
 
-error_code Journal::StartLogging(std::string_view dir) {
-  if (journal_shard.IsOpen()) {
-    return error_code{};
+void Journal::StartInThread() {
+  journal_slice.Init(unsigned(ProactorBase::me()->GetPoolIndex()));
+
+  ServerState::tlocal()->set_journal(this);
+  EngineShard* shard = EngineShard::tlocal();
+  if (shard) {
+    shard->set_journal(this);
   }
-
-  auto* pool = shard_set->pool();
-  atomic_uint32_t created{0};
-  lock_guard lk(state_mu_);
-
-  auto open_cb = [&](auto* pb) {
-    auto ec = journal_shard.Open(dir, unsigned(ProactorBase::GetIndex()));
-    if (ec) {
-      LOG(FATAL) << "Could not create journal " << ec;  // TODO
-    } else {
-      created.fetch_add(1, memory_order_relaxed);
-      ServerState::tlocal()->set_journal(this);
-      EngineShard* shard = EngineShard::tlocal();
-      if (shard) {
-        shard->set_journal(this);
-      }
-    }
-  };
-
-  pool->AwaitFiberOnAll(open_cb);
-
-  if (created.load(memory_order_acquire) != pool->size()) {
-    LOG(FATAL) << "TBD / revert";
-  }
-
-  return error_code{};
 }
 
 error_code Journal::Close() {
-  CHECK(lameduck_.load(memory_order_relaxed));
-
   VLOG(1) << "Journal::Close";
 
-  fibers::mutex ec_mu;
-  error_code res;
+  if (!journal_slice.IsOpen()) {
+    return {};
+  }
 
   lock_guard lk(state_mu_);
   auto close_cb = [&](auto*) {
@@ -75,51 +52,44 @@ error_code Journal::Close() {
     if (shard) {
       shard->set_journal(nullptr);
     }
-
-    auto ec = journal_shard.Close();
-
-    if (ec) {
-      lock_guard lk2(ec_mu);
-      res = ec;
-    }
   };
 
   shard_set->pool()->AwaitFiberOnAll(close_cb);
 
-  return res;
+  return {};
 }
 
-bool Journal::SchedStartTx(TxId txid, unsigned num_keys, unsigned num_shards) {
-  if (!journal_shard.IsOpen() || lameduck_.load(memory_order_relaxed))
-    return false;
+uint32_t Journal::RegisterOnChange(ChangeCallback cb) {
+  return journal_slice.RegisterOnChange(cb);
+}
 
-  journal_shard.AddLogRecord(txid, unsigned(Op::SCHED));
+void Journal::UnregisterOnChange(uint32_t id) {
+  journal_slice.UnregisterOnChange(id);
+}
 
-  return true;
+bool Journal::HasRegisteredCallbacks() const {
+  return journal_slice.HasRegisteredCallbacks();
+}
+
+bool Journal::IsLSNInBuffer(LSN lsn) const {
+  return journal_slice.IsLSNInBuffer(lsn);
+}
+
+std::string_view Journal::GetEntry(LSN lsn) const {
+  return journal_slice.GetEntry(lsn);
 }
 
 LSN Journal::GetLsn() const {
-  return journal_shard.cur_lsn();
+  return journal_slice.cur_lsn();
 }
 
-bool Journal::EnterLameDuck() {
-  if (!journal_shard.IsOpen()) {
-    return false;
-  }
-
-  bool val = false;
-  bool res = lameduck_.compare_exchange_strong(val, true, memory_order_acq_rel);
-  return res;
+void Journal::RecordEntry(TxId txid, Op opcode, DbIndex dbid, unsigned shard_cnt,
+                          std::optional<SlotId> slot, Entry::Payload payload) {
+  journal_slice.AddLogRecord(Entry{txid, opcode, dbid, shard_cnt, slot, std::move(payload)});
 }
 
-void Journal::OpArgs(TxId txid, Op opcode, Span keys) {
-  DCHECK(journal_shard.IsOpen());
-
-  journal_shard.AddLogRecord(txid, unsigned(opcode));
-}
-
-void Journal::RecordEntry(TxId txid, const PrimeKey& key, const PrimeValue& pval) {
-  journal_shard.AddLogRecord(txid, unsigned(Op::VAL));
+void Journal::SetFlushMode(bool allow_flush) {
+  journal_slice.SetFlushMode(allow_flush);
 }
 
 }  // namespace journal

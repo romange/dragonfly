@@ -1,15 +1,18 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
 #include "core/small_string.h"
 
+#include <mimalloc.h>
 #include <xxhash.h>
 
 #include <memory>
 
 #include "base/logging.h"
 #include "core/segment_allocator.h"
+
+extern "C" bool mi_heap_page_is_underutilized(mi_heap_t* heap, void* p, float ratio);
 
 namespace dfly {
 using namespace std;
@@ -40,6 +43,10 @@ void SmallString::InitThreadLocal(void* heap) {
   tl.seg_alloc.reset(ns);
   tl.xxh_state.reset(XXH3_createState());
   XXH3_64bits_reset_withSeed(tl.xxh_state.get(), kHashSeed);
+}
+
+bool SmallString::CanAllocate(size_t size) {
+  return size <= kMaxSize && tl.seg_alloc->CanAllocate();
 }
 
 size_t SmallString::UsedThreadLocal() {
@@ -155,6 +162,7 @@ void SmallString::Get(std::string* dest) const {
 }
 
 unsigned SmallString::GetV(string_view dest[2]) const {
+  DCHECK_GT(size_, kPrefLen);
   if (size_ <= kPrefLen) {
     dest[0] = string_view{prefix_, size_};
     return 1;
@@ -164,6 +172,25 @@ unsigned SmallString::GetV(string_view dest[2]) const {
   uint8_t* ptr = tl.seg_alloc->Translate(small_ptr_);
   dest[1] = string_view{reinterpret_cast<char*>(ptr), size_ - kPrefLen};
   return 2;
+}
+
+bool SmallString::DefragIfNeeded(float ratio) {
+  DCHECK_GT(size_, kPrefLen);
+  if (size_ <= kPrefLen) {
+    return false;
+  }
+
+  uint8_t* cur_real_ptr = tl.seg_alloc->Translate(small_ptr_);
+  if (!mi_heap_page_is_underutilized(tl.seg_alloc->heap(), cur_real_ptr, ratio))
+    return false;
+
+  auto [sp, rp] = tl.seg_alloc->Allocate(size_ - kPrefLen);
+
+  memcpy(rp, cur_real_ptr, size_ - kPrefLen);
+  tl.seg_alloc->Free(small_ptr_);
+  small_ptr_ = sp;
+
+  return true;
 }
 
 }  // namespace dfly

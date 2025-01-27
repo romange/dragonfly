@@ -50,7 +50,12 @@
 #elif defined(__APPLE__)
 #include <malloc/malloc.h>
 #define HAVE_MALLOC_SIZE 1
+#ifdef USE_ZMALLOC_MI
+#define zmalloc_size(p) zmalloc_usable_size(p)
+#else
 #define zmalloc_size(p) malloc_size(p)
+#endif
+#define ZMALLOC_LIB "macos"
 #endif
 
 /* On native libc implementations, we should still do our best to provide a
@@ -111,7 +116,20 @@ size_t zmalloc_get_smap_bytes_by_field(char *field, long pid);
 size_t zmalloc_get_memory_size(void);
 size_t zmalloc_usable_size(const void* p);
 
-// roman: void zlibc_free(void *ptr);
+/* get the memory usage + the number of wasted locations of memory
+Based on a given threshold (ratio < 1).
+Note that if a block is not used, it would not counted as wasted
+*/
+int zmalloc_get_allocator_wasted_blocks(float ratio, size_t* allocated, size_t* commited,
+                                        size_t* wasted);
+
+/*
+ * checks whether a page that the pointer ptr located at is underutilized.
+ * This uses the current local thread heap.
+ * return 0 if not, 1 if underutilized
+ */
+int zmalloc_page_is_underutilized(void *ptr, float ratio);
+char *zstrdup(const char *s);
 
 void init_zmalloc_threadlocal(void* heap);
 extern __thread ssize_t zmalloc_used_memory_tl;

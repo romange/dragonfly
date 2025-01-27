@@ -1,20 +1,35 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
 #include "facade/facade_test.h"
 
 #include <absl/strings/match.h>
+#include <absl/strings/numbers.h>
+
+#include "base/logging.h"
 
 namespace facade {
 
 using namespace testing;
 using namespace std;
 
-bool RespMatcher::MatchAndExplain(const RespExpr& e, MatchResultListener* listener) const {
+bool RespMatcher::MatchAndExplain(RespExpr e, MatchResultListener* listener) const {
   if (e.type != type_) {
-    *listener << "\nWrong type: " << RespExpr::TypeName(e.type);
-    return false;
+    if (e.type == RespExpr::STRING && type_ == RespExpr::DOUBLE) {
+      // Doubles are encoded as strings, unless RESP3 is selected. So parse string and try to
+      // compare it.
+      double d = 0;
+      if (!absl::SimpleAtod(e.GetString(), &d)) {
+        *listener << "\nCan't parse as double: " << e.GetString();
+        return false;
+      }
+      e.type = RespExpr::DOUBLE;
+      e.u = d;
+    } else {
+      *listener << "\nWrong type: " << RespExpr::TypeName(e.type);
+      return false;
+    }
   }
 
   if (type_ == RespExpr::STRING || type_ == RespExpr::ERROR) {
@@ -33,6 +48,12 @@ bool RespMatcher::MatchAndExplain(const RespExpr& e, MatchResultListener* listen
     auto actual = get<int64_t>(e.u);
     if (exp_int_ != actual) {
       *listener << "\nActual : " << actual << " expected: " << exp_int_;
+      return false;
+    }
+  } else if (type_ == RespExpr::DOUBLE) {
+    auto actual = get<double>(e.u);
+    if (abs(exp_double_ - actual) > 0.0001) {
+      *listener << "\nActual : " << actual << " expected: " << exp_double_;
       return false;
     }
   } else if (type_ == RespExpr::ARRAY) {
@@ -59,6 +80,9 @@ void RespMatcher::DescribeTo(std::ostream* os) const {
       break;
     case RespExpr::ARRAY:
       *os << "array of length " << exp_int_;
+      break;
+    case RespExpr::DOUBLE:
+      *os << exp_double_;
       break;
     default:
       *os << "TBD";
