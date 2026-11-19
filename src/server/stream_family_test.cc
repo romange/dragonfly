@@ -1731,6 +1731,26 @@ TEST_F(StreamFamilyTest, XInfoGroups) {
   EXPECT_THAT(resp.GetVec()[0].GetVec(),
               ElementsAre("name", "mygroup", "consumers", IntArg(2), "pending", IntArg(0),
                           "last-delivered-id", "2-0", "entries-read", IntArg(2), "lag", IntArg(0)));
+
+  // Deleting the delivery cursor preserves lag across subsequent appends and partial reads.
+  Run("XDEL mystream 2-0");
+  EXPECT_THAT(Run("XINFO GROUPS mystream").GetVec()[0].GetVec()[11], IntArg(0));
+  Run("XADD mystream 3-0 job next");
+  EXPECT_THAT(Run("XINFO GROUPS mystream").GetVec()[0].GetVec()[11], IntArg(1));
+  Run("XADD mystream 4-0 job later");
+  Run("XREADGROUP GROUP mygroup consumer1 COUNT 1 STREAMS mystream >");
+  resp = Run("XINFO GROUPS mystream");
+  EXPECT_THAT(resp.GetVec()[0].GetVec(),
+              ElementsAre("name", "mygroup", "consumers", IntArg(2), "pending", IntArg(1),
+                          "last-delivered-id", "3-0", "entries-read", IntArg(3), "lag", IntArg(1)));
+
+  // Trim one unread entry after deleting the cursor again. Only 5-0 remains.
+  Run("XDEL mystream 3-0");
+  Run("XADD mystream 5-0 job last");
+  Run("XTRIM mystream MINID 5-0");
+  EXPECT_THAT(Run("XINFO GROUPS mystream").GetVec()[0].GetVec()[11], IntArg(1));
+  Run("XREADGROUP GROUP mygroup consumer1 COUNT 1 STREAMS mystream >");
+  EXPECT_THAT(Run("XINFO GROUPS mystream").GetVec()[0].GetVec()[11], IntArg(0));
 }
 
 TEST_F(StreamFamilyTest, XInfoConsumers) {

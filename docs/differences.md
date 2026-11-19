@@ -10,6 +10,13 @@ Indices (say in GETRANGE and SETRANGE commands) should be signed 32 bit integers
 
 SORT does not take any locale into account.
 
+## Stream consumer group lag
+
+When a group's read count is known, deleting its last delivered entry with `XDEL` preserves lag
+tracking in `XINFO GROUPS` and `XINFO STREAM FULL`. If the group was caught up and a producer
+then appends one entry to the stream, Dragonfly reports lag 1. Redis 7.4.12 and Valkey 8.0.2
+can report null here.
+
 ## Expiry ranges.
 
 Key expirations are limited to 268435455 seconds (2^28 - 1, about 8.5 years) from the command's

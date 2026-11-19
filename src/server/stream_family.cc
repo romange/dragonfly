@@ -225,6 +225,13 @@ long long StreamCGLag(stream* s, streamCG* cg) {
   } else if (cg->entries_read != SCG_INVALID_ENTRIES_READ &&
              !StreamHasTombstonesAfter(s, &cg->last_id)) {
     lag = (long long)s->entries_added - cg->entries_read;
+
+    // XTRIM can also remove an unread prefix without advancing max_deleted_entry_id.
+    // If it trims past the deleted cursor, every remaining entry is unread.
+    if (!StreamIDEqZero(&s->max_deleted_entry_id) &&
+        streamCompareID(&cg->last_id, &s->max_deleted_entry_id) == 0) {
+      lag = std::min<long long>(lag, s->length);
+    }
     valid = 1;
   } else {
     long long entries_read = streamEstimateDistanceFromFirstEverEntry(s, &cg->last_id);
